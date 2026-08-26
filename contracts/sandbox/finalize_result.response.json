@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/finalize_result.response.json",
+  "title": "FinalizeResultResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sandbox_id", "result_id", "status", "finalized_at", "record"],
+  "properties": {
+    "sandbox_id": { "type": "string" },
+    "result_id": { "type": "string" },
+    "status": {
+      "type": "string",
+      "enum": ["finalized", "already_finalized"]
+    },
+    "finalized_at": { "type": "string", "format": "date-time" },
+    "record": { "$ref": "validated_fix_record.json" }
+  }
+}

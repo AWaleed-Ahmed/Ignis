@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-api
+  labels:
+    app: payments-api
+    raphael.scenario: helm-probe-mismatch
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payments-api
+  template:
+    metadata:
+      labels:
+        app: payments-api
+    spec:
+      containers:
+        - name: app
+          image: {{ .Values.image }}
+          args:
+{{- range .Values.imageArgs }}
+            - {{ . | quote }}
+{{- end }}
+          ports:
+            - containerPort: {{ .Values.containerPort }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.probePort }}

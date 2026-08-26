@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raphael.dev/contracts/sandbox/connector/v1/error.schema.json",
+  "title": "ConnectorError",
+  "description": "Either direction. Protocol- or connection-level failure not scoped to one action_id. Per-action failures belong in ConnectorResult with status failed.",
+  "type": "object",
+  "required": ["code", "message"],
+  "additionalProperties": false,
+  "properties": {
+    "job_id": { "type": ["string", "null"], "format": "uuid" },
+    "code": {
+      "type": "string",
+      "enum": [
+        "auth_rejected",
+        "unsupported_protocol_version",
+        "malformed_envelope",
+        "job_lease_expired",
+        "rate_limited",
+        "internal_error"
+      ]
+    },
+    "message": { "type": "string" }
+  }
+}

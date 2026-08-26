@@ -1,0 +1,8 @@
+# Optional baseline objects in the kind cluster (not per-run namespaces).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: raphael-system
+  labels:
+    raphael.managed: "true"
+    raphael.role: system

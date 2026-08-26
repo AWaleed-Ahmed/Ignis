@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/destroy_sandbox.request.json",
+  "title": "DestroySandboxRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "reason": { "type": "string" }
+  }
+}

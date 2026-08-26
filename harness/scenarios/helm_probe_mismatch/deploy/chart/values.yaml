@@ -1,0 +1,8 @@
+replicaCount: 1
+image: hashicorp/http-echo:1.0
+imageArgs:
+  - -listen=:8080
+  - -text=ok
+servicePort: 80
+containerPort: 8080
+probePort: 9090

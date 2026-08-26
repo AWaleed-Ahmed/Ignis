@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-api-v2
+  labels:
+    app: payments-api
+    raphael.scenario: kustomize-rename
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payments-api
+  template:
+    metadata:
+      labels:
+        app: payments-api
+    spec:
+      containers:
+        - name: app
+          image: hashicorp/http-echo:1.0
+          args: ["-listen=:8080", "-text=ok"]
+          ports:
+            - containerPort: 8080
+          env:
+            - name: MISSING
+              valueFrom:
+                configMapKeyRef:
+                  name: payments-config
+                  key: DOES_NOT_EXIST
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: payments-config
+data:
+  LOG_LEVEL: info

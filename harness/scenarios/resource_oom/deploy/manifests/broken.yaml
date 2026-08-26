@@ -1,0 +1,28 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-api
+  labels:
+    app: payments-api
+    raphael.scenario: oom
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payments-api
+  template:
+    metadata:
+      labels:
+        app: payments-api
+    spec:
+      containers:
+        - name: app
+          image: hashicorp/http-echo:1.0
+          args: ["-listen=:8080", "-text=ok"]
+          ports:
+            - containerPort: 8080
+          resources:
+            limits:
+              memory: 8Mi
+            requests:
+              memory: 8Mi

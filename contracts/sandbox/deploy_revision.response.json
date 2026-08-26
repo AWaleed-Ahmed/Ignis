@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/deploy_revision.response.json",
+  "title": "DeployRevisionResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sandbox_id", "status", "rendered_artifact_ids", "fidelity", "deployed_at"],
+  "properties": {
+    "sandbox_id": { "type": "string" },
+    "status": {
+      "type": "string",
+      "enum": ["deployed", "failed", "policy_blocked"]
+    },
+    "resources": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "name"],
+        "properties": {
+          "kind": { "type": "string" },
+          "name": { "type": "string" },
+          "api_version": { "type": "string" }
+        }
+      }
+    },
+    "rendered_artifact_ids": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "image_refs": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "fidelity": { "$ref": "fidelity_report.json" },
+    "tool_versions": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Client tool versions used during deploy (helm/kubectl/kustomize)"
+    },
+    "message": { "type": "string" },
+    "deployed_at": { "type": "string", "format": "date-time" }
+  }
+}

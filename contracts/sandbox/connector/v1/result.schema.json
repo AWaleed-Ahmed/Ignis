@@ -1,0 +1,45 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raphael.dev/contracts/sandbox/connector/v1/result.schema.json",
+  "title": "ConnectorResult",
+  "description": "connector -> dispatch. Structured outcome of exactly one action_id. The connector reports facts and never includes a recommendation for what to do next.",
+  "type": "object",
+  "required": ["job_id", "action_id", "verb", "status"],
+  "additionalProperties": false,
+  "properties": {
+    "job_id": { "type": "string", "format": "uuid" },
+    "action_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Must match the action_id from the corresponding ConnectorAction."
+    },
+    "verb": {
+      "type": "string",
+      "enum": [
+        "create_sandbox",
+        "deploy_revision",
+        "observe_failure",
+        "run_validation",
+        "finalize_result",
+        "destroy_sandbox"
+      ]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "failed", "timeout"]
+    },
+    "result": {
+      "type": "object",
+      "description": "Present when status is ok. Must independently validate against contracts/sandbox/<verb>.response.json."
+    },
+    "error": {
+      "type": ["object", "null"],
+      "description": "Present when status is failed or timeout.",
+      "additionalProperties": false,
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" }
+      }
+    }
+  }
+}

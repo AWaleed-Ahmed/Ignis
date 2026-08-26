@@ -1,0 +1,14 @@
+[project]
+name = "raphael-sandbox-harness"
+version = "0.1.0"
+description = "Demo scenarios and contract/e2e tests for the Raphael sandbox controller"
+requires-python = ">=3.12"
+dependencies = [
+  "httpx>=0.27",
+  "jsonschema>=4.22",
+  "pytest>=8.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,0 +1,22 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raphael.dev/contracts/sandbox/connector/v1/terminal.schema.json",
+  "title": "ConnectorTerminal",
+  "description": "dispatch -> connector. Ends a job. On receipt, the connector stops issuing actions for the job and follows the discard instruction.",
+  "type": "object",
+  "required": ["job_id", "final_status"],
+  "additionalProperties": false,
+  "properties": {
+    "job_id": { "type": "string", "format": "uuid" },
+    "final_status": {
+      "type": "string",
+      "enum": ["fix_finalized", "escalated", "cancelled", "failed"]
+    },
+    "instructions": {
+      "type": "string",
+      "enum": ["discard_local_copy", "retain_for_debug"],
+      "default": "discard_local_copy",
+      "description": "retain_for_debug is only for a short, explicitly bounded pilot troubleshooting window and must never be the standing mode."
+    }
+  }
+}

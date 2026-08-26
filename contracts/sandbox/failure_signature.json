@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/failure_signature.json",
+  "title": "FailureSignature",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "class",
+    "key",
+    "normalized",
+    "reproduced",
+    "evidence_refs",
+    "observed_at"
+  ],
+  "properties": {
+    "class": {
+      "type": "string",
+      "enum": [
+        "invalid_missing_config",
+        "bad_image_reference",
+        "probe_misconfiguration",
+        "resource_constraint",
+        "service_port_mismatch",
+        "helm_kustomize_render_error",
+        "deployment_regression",
+        "policy_blocked",
+        "crash_stack",
+        "unhandled_exception",
+        "http_error",
+        "latency_regression",
+        "k8s_state",
+        "resource_exhaustion",
+        "dependency_timeout",
+        "trace_divergence",
+        "business_invariant",
+        "db_error",
+        "queue_backlog",
+        "network_error",
+        "auth_denied",
+        "unknown",
+        "healthy"
+      ]
+    },
+    "key": {
+      "type": "string",
+      "description": "Stable fingerprint for dedup/matching, e.g. probe_port_mismatch:payments-api:8080!=9090",
+      "minLength": 1
+    },
+    "normalized": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reason", "resource_kind", "resource_name"],
+      "properties": {
+        "reason": { "type": "string" },
+        "message": { "type": "string" },
+        "resource_kind": { "type": "string" },
+        "resource_name": { "type": "string" },
+        "container": { "type": "string" },
+        "attributes": {
+          "type": "object",
+          "additionalProperties": {
+            "type": ["string", "number", "boolean", "null"]
+          }
+        }
+      }
+    },
+    "reproduced": { "type": "boolean" },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "id"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "k8s_event",
+              "pod_status",
+              "container_log",
+              "manifest",
+              "command",
+              "artifact",
+              "apm_metric",
+              "trace_span",
+              "other"
+            ]
+          },
+          "id": { "type": "string" },
+          "path": { "type": "string" },
+          "excerpt": { "type": "string" }
+        }
+      }
+    },
+    "summary": { "type": "string" },
+    "observed_at": { "type": "string", "format": "date-time" }
+  }
+}

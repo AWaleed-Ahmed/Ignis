@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/deploy_revision.request.json",
+  "title": "DeployRevisionRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["repository_sha", "manifests"],
+  "properties": {
+    "repository_sha": { "type": "string", "minLength": 7 },
+    "workspace_path": {
+      "type": "string",
+      "description": "Absolute or controller-relative path to checked-out workspace"
+    },
+    "manifests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["yaml", "helm", "kustomize"]
+        },
+        "path": { "type": "string" },
+        "chart": { "type": "string" },
+        "values": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "overlay": { "type": "string" },
+        "release_name": { "type": "string" }
+      }
+    },
+    "patch": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "unified_diff": { "type": "string" },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "content"],
+            "properties": {
+              "path": { "type": "string" },
+              "content": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "wait_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 600,
+      "default": 60
+    }
+  }
+}

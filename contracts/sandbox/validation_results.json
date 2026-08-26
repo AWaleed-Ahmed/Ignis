@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/validation_results.json",
+  "title": "ValidationResults",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sandbox_id", "passed", "checks", "fail_closed", "full_validation", "completed_at"],
+  "properties": {
+    "sandbox_id": { "type": "string" },
+    "passed": { "type": "boolean" },
+    "fail_closed": {
+      "type": "boolean",
+      "description": "True if validation stopped because a mandatory check could not run"
+    },
+    "full_validation": {
+      "type": "boolean",
+      "description": "True only when checks passed and there are no material fidelity gaps"
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "kind", "status", "duration_ms"],
+        "properties": {
+          "name": { "type": "string" },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "static",
+              "schema",
+              "render",
+              "policy",
+              "rollout",
+              "health_http",
+              "signature_compare",
+              "repository_test",
+              "fidelity"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": ["passed", "failed", "skipped", "unavailable"]
+          },
+          "mandatory": { "type": "boolean" },
+          "duration_ms": { "type": "integer", "minimum": 0 },
+          "command": { "type": "string" },
+          "exit_code": { "type": "integer" },
+          "message": { "type": "string" },
+          "artifact_refs": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "before_signature_key": { "type": ["string", "null"] },
+    "after_signature_key": { "type": ["string", "null"] },
+    "signature_cleared": { "type": ["boolean", "null"] },
+    "tool_versions": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "completed_at": { "type": "string", "format": "date-time" }
+  }
+}

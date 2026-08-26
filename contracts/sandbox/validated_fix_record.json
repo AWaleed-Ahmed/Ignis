@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/validated_fix_record.json",
+  "title": "ValidatedFixRecord",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "result_id",
+    "sandbox_id",
+    "run_id",
+    "repository",
+    "base_commit_sha",
+    "deployed_sha",
+    "validation",
+    "artifact_ids",
+    "content_hash",
+    "finalized_at"
+  ],
+  "properties": {
+    "result_id": { "type": "string" },
+    "sandbox_id": { "type": "string" },
+    "run_id": { "type": "string" },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "name"],
+      "properties": {
+        "owner": { "type": "string" },
+        "name": { "type": "string" }
+      }
+    },
+    "base_commit_sha": { "type": "string" },
+    "deployed_sha": { "type": "string" },
+    "patch": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "unified_diff": { "type": "string" },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "content"],
+            "properties": {
+              "path": { "type": "string" },
+              "content": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "rendered_manifest_artifact_id": { "type": ["string", "null"] },
+    "before_signature": { "$ref": "failure_signature.json" },
+    "after_signature": { "$ref": "failure_signature.json" },
+    "validation": { "$ref": "validation_results.json" },
+    "fidelity": { "$ref": "fidelity_report.json" },
+    "artifact_ids": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "content_hash": {
+      "type": "string",
+      "description": "sha256 hex over canonical frozen payload (patch + rendered manifest + signature keys)"
+    },
+    "notes": { "type": ["string", "null"] },
+    "finalized_at": { "type": "string", "format": "date-time" }
+  }
+}

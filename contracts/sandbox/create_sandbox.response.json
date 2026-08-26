@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/create_sandbox.response.json",
+  "title": "CreateSandboxResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sandbox_id", "namespace", "status", "created_at", "expires_at"],
+  "properties": {
+    "sandbox_id": { "type": "string" },
+    "run_id": { "type": "string" },
+    "namespace": { "type": "string" },
+    "cluster_backend": {
+      "type": "string",
+      "enum": ["kind", "kubeconfig", "mock"]
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ready", "creating", "failed"]
+    },
+    "service_account": { "type": "string" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "expires_at": { "type": "string", "format": "date-time" }
+  }
+}

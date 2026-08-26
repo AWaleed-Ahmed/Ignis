@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/run_validation.request.json",
+  "title": "RunValidationRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["plan"],
+  "properties": {
+    "plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "commands": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "health_checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["type"],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["rollout", "http", "signature_absent"]
+              },
+              "resource": { "type": "string" },
+              "url": { "type": "string" },
+              "expected_status": { "type": "integer" },
+              "timeout_seconds": { "type": "integer", "minimum": 1 },
+              "mandatory": { "type": "boolean", "default": true }
+            }
+          }
+        },
+        "compare_to_signature_key": { "type": "string" }
+      }
+    }
+  }
+}

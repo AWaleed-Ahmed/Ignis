@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/observe_failure.response.json",
+  "title": "ObserveFailureResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sandbox_id", "signature", "artifact_ids"],
+  "properties": {
+    "sandbox_id": { "type": "string" },
+    "signature": { "$ref": "failure_signature.json" },
+    "matched_expected": { "type": ["boolean", "null"] },
+    "artifact_ids": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "fidelity": { "$ref": "fidelity_report.json" }
+  }
+}

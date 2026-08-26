@@ -1,0 +1,15 @@
+{
+  "name": "payments-test",
+  "description": "Synthetic secret fixtures for sandbox reproduction",
+  "secrets": [
+    {
+      "name": "payments-db",
+      "data": {
+        "DATABASE_URL": "postgres://payments:synthetic@db.sandbox.local:5432/payments"
+      },
+      "labels": {
+        "raphael.secret_fixture": "true"
+      }
+    }
+  ]
+}

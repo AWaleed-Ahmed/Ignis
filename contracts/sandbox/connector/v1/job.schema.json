@@ -1,0 +1,49 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raphael.dev/contracts/sandbox/connector/v1/job.schema.json",
+  "title": "ConnectorJob",
+  "description": "dispatch -> connector. A unit of work containing enough identity for the connector to clone the repository locally and create a sandbox. It never contains source code, diffs, or file contents.",
+  "type": "object",
+  "required": ["job_id", "repository", "commit_sha", "narrowed_location"],
+  "additionalProperties": false,
+  "properties": {
+    "job_id": { "type": "string", "format": "uuid" },
+    "repository": {
+      "type": "object",
+      "required": ["clone_url"],
+      "additionalProperties": false,
+      "properties": {
+        "clone_url": {
+          "type": "string",
+          "format": "uri",
+          "description": "Uses the customer's own repository access; not a credentialed URL from Raphael."
+        },
+        "name": { "type": "string" }
+      }
+    },
+    "commit_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{7,40}$"
+    },
+    "narrowed_location": {
+      "type": "object",
+      "description": "A private-core failure-detection result that tells the sandbox where to look, not what to do about it.",
+      "required": ["file_path"],
+      "additionalProperties": false,
+      "properties": {
+        "file_path": { "type": "string" },
+        "line_start": { "type": "integer", "minimum": 1 },
+        "line_end": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "sandbox_profile": {
+      "type": "string",
+      "description": "Name of a locally resolved sandbox profile. The profile contents never leave the customer environment."
+    },
+    "lease_ttl_seconds": {
+      "type": "integer",
+      "minimum": 30,
+      "description": "How long the connector may hold this job before dispatch considers it abandoned and reassigns or escalates it."
+    }
+  }
+}

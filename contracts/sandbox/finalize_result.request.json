@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/finalize_result.request.json",
+  "title": "FinalizeResultRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "notes": {
+      "type": "string",
+      "description": "Optional human/agent note stored with the frozen result"
+    },
+    "require_patch": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true, finalize fails unless a patch was supplied on a prior deploy_revision"
+    }
+  }
+}

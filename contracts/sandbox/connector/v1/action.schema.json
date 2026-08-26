@@ -1,0 +1,32 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raphael.dev/contracts/sandbox/connector/v1/action.schema.json",
+  "title": "ConnectorAction",
+  "description": "dispatch -> connector. Exactly one instructed step. The connector executes this verb against the local controller and nothing else. args is validated against the existing frozen per-verb request schema.",
+  "type": "object",
+  "required": ["job_id", "action_id", "verb", "args"],
+  "additionalProperties": false,
+  "properties": {
+    "job_id": { "type": "string", "format": "uuid" },
+    "action_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Idempotency key for this single step. Replaying the same action_id must return a cached result instead of re-executing a side effect."
+    },
+    "verb": {
+      "type": "string",
+      "enum": [
+        "create_sandbox",
+        "deploy_revision",
+        "observe_failure",
+        "run_validation",
+        "finalize_result",
+        "destroy_sandbox"
+      ]
+    },
+    "args": {
+      "type": "object",
+      "description": "Verb-specific request body. Must independently validate against contracts/sandbox/<verb>.request.json. No arbitrary shell or kubectl operation is legal."
+    }
+  }
+}

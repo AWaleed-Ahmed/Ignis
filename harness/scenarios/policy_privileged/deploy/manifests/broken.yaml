@@ -1,0 +1,21 @@
+# Unsafe privileged container — must be policy_blocked.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: evil
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: evil
+  template:
+    metadata:
+      labels:
+        app: evil
+    spec:
+      containers:
+        - name: app
+          image: hashicorp/http-echo:1.0
+          args: ["-listen=:8080", "-text=ok"]
+          securityContext:
+            privileged: true

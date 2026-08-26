@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/destroy_sandbox.response.json",
+  "title": "DestroySandboxResponse",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["sandbox_id", "status", "destroyed_at"],
+  "properties": {
+    "sandbox_id": { "type": "string" },
+    "status": {
+      "type": "string",
+      "enum": ["destroyed", "already_destroyed", "cleanup_queued"]
+    },
+    "namespace": { "type": "string" },
+    "message": { "type": "string" },
+    "destroyed_at": { "type": "string", "format": "date-time" }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raphael.dev/contracts/sandbox/connector/v1/envelope.schema.json",
+  "title": "ConnectorEnvelope",
+  "description": "Outer wire message for the connector<->dispatch stream. Every frame sent in either direction over the persistent outbound connection uses this shape. The payload schema is selected by 'kind'.",
+  "type": "object",
+  "required": ["protocol_version", "message_id", "kind", "sent_at", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "protocol_version": {
+      "type": "string",
+      "const": "1.0",
+      "description": "Wire protocol version. Bump on any breaking change to envelope or payload shapes."
+    },
+    "message_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique id for this exact message, used for ack/idempotency."
+    },
+    "job_id": {
+      "type": ["string", "null"],
+      "format": "uuid",
+      "description": "The job this message belongs to. Null only for connection-level 'error' messages not tied to a specific job."
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["job", "action", "result", "ack", "terminal", "error"],
+      "description": "job: dispatch->connector, new work offer. action: dispatch->connector, one instructed step. result: connector->dispatch, structured outcome. ack: either direction, confirms receipt. terminal: dispatch->connector, job is done. error: either direction, protocol or connection failure."
+    },
+    "sent_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "payload": {
+      "type": "object",
+      "description": "Validated against the payload schema selected by kind."
+    }
+  },
+  "allOf": [
+    { "if": { "properties": { "kind": { "const": "job" } } }, "then": { "properties": { "payload": { "$ref": "job.schema.json" } } } },
+    { "if": { "properties": { "kind": { "const": "action" } } }, "then": { "properties": { "payload": { "$ref": "action.schema.json" } } } },
+    { "if": { "properties": { "kind": { "const": "result" } } }, "then": { "properties": { "payload": { "$ref": "result.schema.json" } } } },
+    { "if": { "properties": { "kind": { "const": "ack" } } }, "then": { "properties": { "payload": { "$ref": "ack.schema.json" } } } },
+    { "if": { "properties": { "kind": { "const": "terminal" } } }, "then": { "properties": { "payload": { "$ref": "terminal.schema.json" } } } },
+    { "if": { "properties": { "kind": { "const": "error" } } }, "then": { "properties": { "payload": { "$ref": "error.schema.json" } } } }
+  ]
+}

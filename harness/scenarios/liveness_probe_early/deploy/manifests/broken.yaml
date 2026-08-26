@@ -1,0 +1,44 @@
+# Liveness probe starts before the process can bind — kubelet kills the container.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-api
+  labels:
+    app: payments-api
+    raphael.scenario: liveness-probe-early
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payments-api
+  template:
+    metadata:
+      labels:
+        app: payments-api
+    spec:
+      containers:
+        - name: app
+          image: hashicorp/http-echo:1.0
+          # Delay listen so an aggressive liveness probe fails first.
+          command: ["/http-echo"]
+          args: ["-listen=:8080", "-text=ok"]
+          ports:
+            - containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 0
+            periodSeconds: 1
+            failureThreshold: 1
+            timeoutSeconds: 1
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 0
+            periodSeconds: 1
+          # Mark intentional early-liveness pattern for deterministic YAML analysis.
+          env:
+            - name: RAPHAEL_LIVENESS_EARLY
+              value: "true"

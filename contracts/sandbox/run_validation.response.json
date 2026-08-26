@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/run_validation.response.json",
+  "title": "RunValidationResponse",
+  "allOf": [{ "$ref": "validation_results.json" }]
+}

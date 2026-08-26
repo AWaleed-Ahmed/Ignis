@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/observe_failure.request.json",
+  "title": "ObserveFailureRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "timeout_seconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 600,
+      "default": 90
+    },
+    "expected_signature_key": { "type": "string" }
+  }
+}

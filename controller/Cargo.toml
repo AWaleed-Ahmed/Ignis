@@ -1,0 +1,31 @@
+[package]
+name = "raphael-sandbox-controller"
+version = "0.1.0"
+edition = "2021"
+description = "Raphael ephemeral Kubernetes sandbox controller"
+license = "Apache-2.0"
+
+[dependencies]
+axum = { version = "0.8", features = ["json", "macros"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+sha2 = "0.10"
+hex = "0.4"
+regex = "1"
+async-trait = "0.1"
+tempfile = "3"
+walkdir = "2"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }

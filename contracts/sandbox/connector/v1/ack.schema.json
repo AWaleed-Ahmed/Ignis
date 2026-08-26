@@ -1,0 +1,12 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raphael.dev/contracts/sandbox/connector/v1/ack.schema.json",
+  "title": "ConnectorAck",
+  "description": "Either direction. Confirms a specific message_id was received, independent of whether processing it succeeded. Success or failure is reported through result or error.",
+  "type": "object",
+  "required": ["acked_message_id"],
+  "additionalProperties": false,
+  "properties": {
+    "acked_message_id": { "type": "string", "format": "uuid" }
+  }
+}

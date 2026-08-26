@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/create_sandbox.request.json",
+  "title": "CreateSandboxRequest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "tenant_id", "repository", "commit_sha"],
+  "properties": {
+    "run_id": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "tenant_id": { "type": "string", "minLength": 1 },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "name"],
+      "properties": {
+        "owner": { "type": "string" },
+        "name": { "type": "string" },
+        "clone_url": { "type": "string" }
+      }
+    },
+    "commit_sha": { "type": "string", "minLength": 7 },
+    "target_environment": { "type": "string" },
+    "timeout_minutes": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 120,
+      "default": 20
+    },
+    "secret_fixture_set": { "type": "string" },
+    "labels": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    }
+  }
+}

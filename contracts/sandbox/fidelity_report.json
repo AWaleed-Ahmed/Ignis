@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/fidelity_report.json",
+  "title": "FidelityReport",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["score", "checklist", "material_gaps"],
+  "properties": {
+    "score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "checklist": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "same_commit",
+        "same_render_path",
+        "same_image_digest_or_tag",
+        "equivalent_non_secret_config",
+        "dependencies_available"
+      ],
+      "properties": {
+        "same_commit": { "type": "boolean" },
+        "same_render_path": { "type": "boolean" },
+        "same_image_digest_or_tag": { "type": "boolean" },
+        "equivalent_k8s_semantics": { "type": "boolean" },
+        "equivalent_non_secret_config": { "type": "boolean" },
+        "dependencies_available": { "type": "boolean" }
+      }
+    },
+    "substitutions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "reason"],
+        "properties": {
+          "name": { "type": "string" },
+          "reason": { "type": "string" }
+        }
+      }
+    },
+    "material_gaps": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}

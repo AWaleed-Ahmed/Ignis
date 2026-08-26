@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/error_envelope.json",
+  "title": "ErrorEnvelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["error"],
+  "properties": {
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "invalid_request",
+            "not_found",
+            "conflict",
+            "policy_blocked",
+            "render_failed",
+            "deploy_failed",
+            "observation_failed",
+            "validation_unavailable",
+            "validation_failed",
+            "cluster_unavailable",
+            "timeout",
+            "internal"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" },
+        "details": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "sandbox_id": { "type": "string" },
+        "run_id": { "type": "string" }
+      }
+    }
+  }
+}

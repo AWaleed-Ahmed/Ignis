@@ -1,0 +1,5 @@
+{
+  "scenario": "probe_port_mismatch",
+  "expected_class": "probe_misconfiguration",
+  "expected_key_prefix": "probe_port_mismatch:payments-api:"
+}

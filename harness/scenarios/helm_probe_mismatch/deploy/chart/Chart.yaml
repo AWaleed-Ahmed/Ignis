@@ -1,0 +1,7 @@
+# Helm chart with pre-expanded templates (works with helm or fallback concat).
+apiVersion: v2
+name: payments
+description: Demo payments chart for Raphael sandbox
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
