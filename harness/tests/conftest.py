@@ -14,8 +14,11 @@ def client() -> SandboxClient:
     return SandboxClient()
 
 
-@pytest.fixture(scope="session", autouse=True)
-def require_controller(client: SandboxClient):
+@pytest.fixture(autouse=True)
+def require_controller(request: pytest.FixtureRequest, client: SandboxClient):
+    # Contract tests validate pinned schemas only and must run without a live controller.
+    if request.node.module.__name__.endswith("test_contracts"):
+        return
     try:
         health = client.health()
     except Exception as exc:  # noqa: BLE001

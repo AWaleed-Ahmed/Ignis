@@ -159,13 +159,20 @@ struct ErrorPayload {
 }
 
 #[derive(Debug, Clone)]
+struct CachedAction {
+    verb: String,
+    args: Value,
+    frame: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct LocalJob {
     job: Job,
     workspace_path: PathBuf,
     sandbox_id: Option<String>,
     last_activity: DateTime<Utc>,
     terminal: bool,
-    processed_actions: HashMap<String, Value>,
+    processed_actions: HashMap<String, CachedAction>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -530,11 +537,14 @@ where
             )]);
         }
         if let Some(cached) = local.processed_actions.get(&action.action_id) {
-            let frame = cached
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| cached.to_string());
-            return Ok(vec![frame]);
+            if cached.verb != action.verb || cached.args != action.args {
+                return Ok(vec![self.error_frame(
+                    Some(action.job_id.clone()),
+                    "malformed_envelope",
+                    "action_id replay payload mismatch".into(),
+                )]);
+            }
+            return Ok(vec![cached.frame.clone()]);
         }
         local.last_activity = Utc::now();
         let result = match action.verb.as_str() {
@@ -570,9 +580,14 @@ where
                 }),
             ),
         };
-        local
-            .processed_actions
-            .insert(action.action_id, Value::String(frame.clone()));
+        local.processed_actions.insert(
+            action.action_id,
+            CachedAction {
+                verb: action.verb.clone(),
+                args: action.args.clone(),
+                frame: frame.clone(),
+            },
+        );
         Ok(vec![frame])
     }
 
@@ -778,7 +793,12 @@ fn validate_job(job: &Job) -> Result<(), ConnectorError> {
     }
     let clone_url = url::Url::parse(&job.repository.clone_url)
         .map_err(|_| ConnectorError::Malformed("repository.clone_url must be a URI".into()))?;
-    if !clone_url.username().is_empty() || clone_url.password().is_some() {
+    if !clone_url.username().is_empty()
+        || clone_url.password().is_some()
+        || clone_url.query_pairs().any(|(key, _)| {
+            ["token", "access_token", "auth", "password", "secret"].contains(&key.as_ref())
+        })
+    {
         return Err(ConnectorError::Malformed(
             "repository.clone_url must not contain credentials".into(),
         ));
@@ -1145,6 +1165,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_credentialed_repository_urls() {
+        for clone_url in [
+            "https://user:secret@example.com/service.git",
+            "https://example.com/service.git?access_token=secret",
+        ] {
+            let mut candidate = job();
+            candidate.repository.clone_url = clone_url.into();
+            let error = validate_job(&candidate).unwrap_err();
+            assert!(error.to_string().contains("must not contain credentials"));
+        }
+    }
+
+    #[test]
     fn rejects_unknown_verbs_and_extra_action_fields() {
         let id = Uuid::new_v4().to_string();
         let action = json!({"protocol_version":"1.0","message_id":Uuid::new_v4().to_string(),"kind":"action","sent_at":Utc::now().to_rfc3339(),"payload":{"job_id":id,"action_id":Uuid::new_v4().to_string(),"verb":"shell","args":{},"extra":true}});
@@ -1175,6 +1208,46 @@ mod tests {
         let second = connector.handle_value(frame).await.unwrap();
         assert_eq!(fake.calls.lock().await.len(), 1);
         assert_eq!(first[1], second[1]);
+    }
+
+    #[tokio::test]
+    async fn replayed_action_id_with_different_payload_is_rejected() {
+        let fake = FakeExecutor::default();
+        let connector = Connector::new(config(), fake.clone());
+        let job = job();
+        let job_id = job.job_id.clone();
+        let dir = tempdir().unwrap();
+        connector.jobs.lock().await.insert(
+            job_id.clone(),
+            LocalJob {
+                job,
+                workspace_path: dir.path().to_path_buf(),
+                sandbox_id: Some("sb-test".into()),
+                last_activity: Utc::now(),
+                terminal: false,
+                processed_actions: HashMap::new(),
+            },
+        );
+        let action_id = Uuid::new_v4().to_string();
+        let first = connector
+            .handle_value(action(&job_id, &action_id, "observe_failure", json!({})))
+            .await
+            .unwrap();
+        let second = connector
+            .handle_value(action(
+                &job_id,
+                &action_id,
+                "observe_failure",
+                json!({"timeout_seconds": 30}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(fake.calls.lock().await.len(), 1);
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        let error: Value = serde_json::from_str(&second[1]).unwrap();
+        assert_eq!(error["kind"], "error");
+        assert_eq!(error["payload"]["code"], "malformed_envelope");
     }
 
     #[tokio::test]
@@ -1221,7 +1294,11 @@ mod tests {
         let job = job();
         let job_id = job.job_id.clone();
         let create_action_id = Uuid::new_v4().to_string();
+        let deploy_action_id = Uuid::new_v4().to_string();
         let observe_action_id = Uuid::new_v4().to_string();
+        let patch_action_id = Uuid::new_v4().to_string();
+        let validation_action_id = Uuid::new_v4().to_string();
+        let finalize_action_id = Uuid::new_v4().to_string();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket =
@@ -1279,6 +1356,22 @@ mod tests {
             let result = wait_for_result(&mut socket).await;
             assert_eq!(result["payload"]["action_id"], create_action_id);
 
+            let deploy_args = json!({
+                "repository_sha": "0123456789abcdef0123456789abcdef01234567",
+                "manifests": {"type": "yaml", "path": "deploy/app.yaml"}
+            });
+            let deploy_frame = envelope(
+                "action",
+                Some(job_id.clone()),
+                json!({"job_id":job_id,"action_id":deploy_action_id,"verb":"deploy_revision","args":deploy_args}),
+            );
+            socket
+                .send(Message::Text(deploy_frame.to_string().into()))
+                .await
+                .unwrap();
+            let result = wait_for_result(&mut socket).await;
+            assert_eq!(result["payload"]["action_id"], deploy_action_id);
+
             let observe_frame = envelope(
                 "action",
                 Some(job_id.clone()),
@@ -1290,6 +1383,47 @@ mod tests {
                 .unwrap();
             let result = wait_for_result(&mut socket).await;
             assert_eq!(result["payload"]["action_id"], observe_action_id);
+
+            let patch_args = json!({
+                "repository_sha": "0123456789abcdef0123456789abcdef01234567",
+                "manifests": {"type": "yaml", "path": "deploy/app.yaml"},
+                "patch": {"unified_diff": "diff --git a/deploy/app.yaml b/deploy/app.yaml\n"}
+            });
+            let patch_frame = envelope(
+                "action",
+                Some(job_id.clone()),
+                json!({"job_id":job_id,"action_id":patch_action_id,"verb":"deploy_revision","args":patch_args}),
+            );
+            socket
+                .send(Message::Text(patch_frame.to_string().into()))
+                .await
+                .unwrap();
+            let result = wait_for_result(&mut socket).await;
+            assert_eq!(result["payload"]["action_id"], patch_action_id);
+
+            let validation_frame = envelope(
+                "action",
+                Some(job_id.clone()),
+                json!({"job_id":job_id,"action_id":validation_action_id,"verb":"run_validation","args":{"plan":{"commands":[],"health_checks":[]}}}),
+            );
+            socket
+                .send(Message::Text(validation_frame.to_string().into()))
+                .await
+                .unwrap();
+            let result = wait_for_result(&mut socket).await;
+            assert_eq!(result["payload"]["action_id"], validation_action_id);
+
+            let finalize_frame = envelope(
+                "action",
+                Some(job_id.clone()),
+                json!({"job_id":job_id,"action_id":finalize_action_id,"verb":"finalize_result","args":{"notes":"validated","require_patch":true}}),
+            );
+            socket
+                .send(Message::Text(finalize_frame.to_string().into()))
+                .await
+                .unwrap();
+            let result = wait_for_result(&mut socket).await;
+            assert_eq!(result["payload"]["action_id"], finalize_action_id);
 
             let terminal = envelope(
                 "terminal",
@@ -1317,7 +1451,7 @@ mod tests {
         );
         let _ = connector.run_once().await;
         server.await.unwrap();
-        assert_eq!(fake.calls.lock().await.len(), 2);
+        assert_eq!(fake.calls.lock().await.len(), 6);
         assert!(auth_seen.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(*fake.destroyed.lock().await, 1);
         assert!(!workspace.exists());

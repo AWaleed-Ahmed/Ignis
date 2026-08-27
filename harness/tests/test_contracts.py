@@ -5,7 +5,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
-CONTRACTS = Path(__file__).resolve().parents[3] / "contracts" / "sandbox"
+CONTRACTS = Path(__file__).resolve().parents[2] / "contracts" / "sandbox"
 
 
 def _load(name: str) -> dict:
@@ -68,6 +68,7 @@ def test_validation_results_schema():
         "sandbox_id": "sb-abc",
         "passed": False,
         "fail_closed": True,
+        "full_validation": False,
         "checks": [
             {
                 "name": "http",
