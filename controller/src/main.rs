@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use raphael_sandbox_controller::api::router;
 use raphael_sandbox_controller::cleanup::ttl::TtlReaper;
+use raphael_sandbox_controller::connector::{Connector, ConnectorConfig};
 use raphael_sandbox_controller::domain::service::SandboxService;
 use raphael_sandbox_controller::k8s::{create_backend, ClusterBackend};
 use raphael_sandbox_controller::state::registry::SandboxRegistry;
@@ -62,6 +63,12 @@ async fn main() -> anyhow::Result<()> {
     let _ = raphael_sandbox_controller::artifacts::ensure_root();
 
     let service = Arc::new(SandboxService::new(backend.clone(), registry.clone()));
+
+    if let Some(config) = ConnectorConfig::from_env()? {
+        tracing::info!(dispatch_url = %config.dispatch_url, controller_url = %config.controller_url, "starting outbound connector");
+        let connector = Arc::new(Connector::from_config(config));
+        tokio::spawn(connector.run_forever());
+    }
 
     let reaper = TtlReaper::new(service.clone(), Duration::from_secs(30));
     tokio::spawn(async move {
