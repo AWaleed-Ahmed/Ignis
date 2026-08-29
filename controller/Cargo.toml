@@ -26,7 +26,6 @@ async-trait = "0.1"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tempfile = "3"
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 url = "2"
 walkdir = "2"
 

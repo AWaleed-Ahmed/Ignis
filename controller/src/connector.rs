@@ -6,17 +6,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{connect_async, WebSocketStream};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -24,7 +18,6 @@ use crate::gitclone::clone_at_sha;
 
 const PROTOCOL_VERSION: &str = "1.0";
 const MAX_RECONNECT_SECONDS: u64 = 30;
-const LEASE_CHECK_SECONDS: u64 = 1;
 const ALLOWED_VERBS: [&str; 6] = [
     "create_sandbox",
     "deploy_revision",
@@ -40,6 +33,7 @@ pub struct ConnectorConfig {
     pub token: String,
     pub controller_url: String,
     pub tenant_id: String,
+    pub polling_interval: Duration,
 }
 
 impl ConnectorConfig {
@@ -59,9 +53,9 @@ impl ConnectorConfig {
         let parsed_url = dispatch_url
             .parse::<url::Url>()
             .map_err(|_| anyhow::anyhow!("RAPHAEL_CONNECTOR_DISPATCH_URL must be a valid URL"))?;
-        if !["ws", "wss"].contains(&parsed_url.scheme()) {
+        if !["http", "https"].contains(&parsed_url.scheme()) {
             return Err(anyhow::anyhow!(
-                "RAPHAEL_CONNECTOR_DISPATCH_URL must use ws:// or wss://"
+                "RAPHAEL_CONNECTOR_DISPATCH_URL must use http:// or https://"
             ));
         }
         Ok(Some(Self {
@@ -71,6 +65,12 @@ impl ConnectorConfig {
                 .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string()),
             tenant_id: env::var("RAPHAEL_CONNECTOR_TENANT_ID")
                 .unwrap_or_else(|_| "connector".to_string()),
+            polling_interval: Duration::from_millis(
+                env::var("RAPHAEL_CONNECTOR_POLL_INTERVAL_MS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(1000),
+            ),
         }))
     }
 }
@@ -371,22 +371,50 @@ where
     }
 
     pub async fn run_once(&self) -> Result<(), ConnectorError> {
-        let mut request = self
-            .config
-            .dispatch_url
-            .clone()
-            .into_client_request()
-            .map_err(|e| ConnectorError::Execution(e.to_string()))?;
-        let auth = format!("Bearer {}", self.config.token);
-        request.headers_mut().insert(
-            AUTHORIZATION,
-            auth.parse()
-                .map_err(|e| ConnectorError::Execution(format!("invalid auth header: {e}")))?,
+        let client = Client::new();
+        let url = format!(
+            "{}/v1/tenants/{}/jobs/next",
+            self.config.dispatch_url.trim_end_matches('/'),
+            self.config.tenant_id
         );
-        let (socket, _) = connect_async(request)
+        let response = client
+            .get(url)
+            .bearer_auth(&self.config.token)
+            .send()
             .await
             .map_err(|e| ConnectorError::Execution(e.to_string()))?;
-        self.run_socket(socket).await
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            || response.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(ConnectorError::Execution(format!(
+                "dispatch authentication failed: {}",
+                response.status()
+            )));
+        }
+        if !response.status().is_success() {
+            return Err(ConnectorError::Execution(format!(
+                "dispatch returned {}",
+                response.status()
+            )));
+        }
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|e| ConnectorError::Malformed(e.to_string()))?;
+        let messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ConnectorError::Malformed("dispatch response missing messages array".into())
+            })?;
+        if messages.is_empty() {
+            sleep(self.config.polling_interval).await;
+            return Ok(());
+        }
+        for message in messages {
+            self.process_http_message(&client, message).await?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -409,48 +437,117 @@ where
             .unwrap_or_else(|| ConnectorError::Execution("no reconnect attempts requested".into())))
     }
 
-    async fn run_socket<S>(&self, socket: WebSocketStream<S>) -> Result<(), ConnectorError>
-    where
-        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    {
-        let (mut sink, mut stream) = socket.split();
-        let mut ticker = tokio::time::interval(Duration::from_secs(LEASE_CHECK_SECONDS));
-        loop {
-            tokio::select! {
-                incoming = stream.next() => {
-                    match incoming {
-                        Some(Ok(Message::Text(text))) => {
-                            let responses = self.handle_text(&text).await;
-                            for response in responses {
-                                sink.send(Message::Text(response.into())).await
-                                    .map_err(|e| ConnectorError::Execution(e.to_string()))?;
-                            }
-                        }
-                        Some(Ok(Message::Binary(bytes))) => {
-                            let text = String::from_utf8(bytes.to_vec())
-                                .map_err(|e| ConnectorError::Malformed(e.to_string()))?;
-                            for response in self.handle_text(&text).await {
-                                sink.send(Message::Text(response.into())).await
-                                    .map_err(|e| ConnectorError::Execution(e.to_string()))?;
-                            }
-                        }
-                        Some(Ok(Message::Ping(payload))) => {
-                            sink.send(Message::Pong(payload)).await
-                                .map_err(|e| ConnectorError::Execution(e.to_string()))?;
-                        }
-                        Some(Ok(Message::Close(_))) | None => return Err(ConnectorError::Execution("websocket closed".into())),
-                        Some(Err(error)) => return Err(ConnectorError::Execution(error.to_string())),
-                        Some(Ok(_)) => {}
+    async fn process_http_message(
+        &self,
+        client: &Client,
+        value: &Value,
+    ) -> Result<(), ConnectorError> {
+        let mut pending = vec![value.clone()];
+        while let Some(value) = pending.pop() {
+            let envelope = parse_envelope(&value)?;
+            match envelope.kind.as_str() {
+                "action" => {
+                    let action: Action = serde_json::from_value(envelope.payload)
+                        .map_err(|e| ConnectorError::Malformed(e.to_string()))?;
+                    let job_id = action.job_id.clone();
+                    if action.verb == "create_sandbox" {
+                        let args = action.args.as_object().ok_or_else(|| {
+                            ConnectorError::Malformed(
+                                "create_sandbox args must be an object".into(),
+                            )
+                        })?;
+                        let repository = args
+                            .get("repository")
+                            .and_then(Value::as_object)
+                            .ok_or_else(|| {
+                                ConnectorError::Malformed(
+                                    "create_sandbox args missing repository".into(),
+                                )
+                            })?;
+                        let commit_sha = args
+                            .get("commit_sha")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                ConnectorError::Malformed(
+                                    "create_sandbox args missing commit_sha".into(),
+                                )
+                            })?;
+                        let clone_url = repository
+                            .get("clone_url")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                ConnectorError::Malformed(
+                                    "create_sandbox repository missing clone_url".into(),
+                                )
+                            })?;
+                        let name = repository
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        let job = Job {
+                            job_id: job_id.clone(),
+                            repository: Repository {
+                                clone_url: clone_url.into(),
+                                name,
+                            },
+                            commit_sha: commit_sha.into(),
+                            narrowed_location: NarrowedLocation {
+                                file_path: "deploy/app.yaml".into(),
+                                line_start: None,
+                                line_end: None,
+                            },
+                            sandbox_profile: None,
+                            lease_ttl_seconds: None,
+                        };
+                        self.handle_job(job).await?;
                     }
-                }
-                _ = ticker.tick() => {
-                    for response in self.reap_expired().await {
-                        sink.send(Message::Text(response.into())).await
-                            .map_err(|e| ConnectorError::Execution(e.to_string()))?;
+                    let frames = self.handle_action(action).await?;
+                    let result = frames
+                        .into_iter()
+                        .find_map(|frame| serde_json::from_str::<Value>(&frame).ok())
+                        .ok_or_else(|| {
+                            ConnectorError::Malformed("action produced no result".into())
+                        })?;
+                    let url = format!(
+                        "{}/v1/results",
+                        self.config.dispatch_url.trim_end_matches('/')
+                    );
+                    let response = client
+                        .post(url)
+                        .bearer_auth(&self.config.token)
+                        .json(&result)
+                        .send()
+                        .await
+                        .map_err(|e| ConnectorError::Execution(e.to_string()))?;
+                    if !response.status().is_success() {
+                        return Err(ConnectorError::Execution(format!(
+                            "dispatch returned {}",
+                            response.status()
+                        )));
                     }
+                    let body: Value = response
+                        .json()
+                        .await
+                        .map_err(|e| ConnectorError::Malformed(e.to_string()))?;
+                    let next = body
+                        .get("messages")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            ConnectorError::Malformed(
+                                "result response missing messages array".into(),
+                            )
+                        })?;
+                    pending.extend(next.iter().cloned());
                 }
+                "terminal" => {
+                    let terminal: Terminal = serde_json::from_value(envelope.payload)
+                        .map_err(|e| ConnectorError::Malformed(e.to_string()))?;
+                    self.handle_terminal(terminal).await?;
+                }
+                _ => return Err(ConnectorError::Unsupported(envelope.kind)),
             }
         }
+        Ok(())
     }
 
     async fn handle_text(&self, text: &str) -> Vec<String> {
@@ -1070,6 +1167,8 @@ fn error_code(error: &ConnectorError) -> &'static str {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[derive(Clone, Default)]
     struct FakeExecutor {
@@ -1131,11 +1230,42 @@ mod tests {
 
     fn config() -> ConnectorConfig {
         ConnectorConfig {
-            dispatch_url: "ws://127.0.0.1:1".into(),
+            dispatch_url: "http://127.0.0.1:1".into(),
             token: "test-token".into(),
             controller_url: "http://127.0.0.1:8090".into(),
             tenant_id: "connector".into(),
+            polling_interval: Duration::from_millis(1),
         }
+    }
+
+    async fn http_fixture(responses: Vec<Value>) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            let mut responses = responses.into_iter();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = vec![0; 65536];
+                let size = stream.read(&mut buffer).await.unwrap();
+                if size == 0 {
+                    continue;
+                }
+                let request = String::from_utf8_lossy(&buffer[..size]).to_string();
+                seen.push(request.clone());
+                let body = responses
+                    .next()
+                    .unwrap_or_else(|| json!({"messages":[],"pending":false}))
+                    .to_string();
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                stream.write_all(reply.as_bytes()).await.unwrap();
+                if responses.len() == 0 {
+                    break;
+                }
+            }
+            seen
+        });
+        (format!("http://{}", address), server)
     }
 
     fn job() -> Job {
@@ -1281,180 +1411,215 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fake_dispatch_server_runs_job_actions_and_terminal_cleanup() {
-        use futures_util::{SinkExt, StreamExt};
-        use tokio::net::TcpListener;
-        use tokio_tungstenite::accept_hdr_async;
-        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+    async fn http_empty_queue_is_safe() {
+        let connector = Connector::new(config(), FakeExecutor::default());
+        let error = connector.run_once().await.unwrap_err();
+        assert!(matches!(error, ConnectorError::Execution(_)));
+    }
 
+    #[tokio::test]
+    async fn http_empty_queue_is_polled_again_by_run_forever() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let auth_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let server_auth_seen = auth_seen.clone();
-        let job = job();
-        let job_id = job.job_id.clone();
-        let create_action_id = Uuid::new_v4().to_string();
-        let deploy_action_id = Uuid::new_v4().to_string();
-        let observe_action_id = Uuid::new_v4().to_string();
-        let patch_action_id = Uuid::new_v4().to_string();
-        let validation_action_id = Uuid::new_v4().to_string();
-        let finalize_action_id = Uuid::new_v4().to_string();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket =
-                accept_hdr_async(stream, move |request: &Request, response: Response| {
-                    if request
-                        .headers()
-                        .get(AUTHORIZATION)
-                        .and_then(|value| value.to_str().ok())
-                        == Some("Bearer test-token")
-                    {
-                        server_auth_seen.store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    Ok(response)
-                })
-                .await
-                .unwrap();
-            let job_frame = envelope(
-                "job",
-                Some(job_id.clone()),
-                serde_json::to_value(&job).unwrap(),
-            );
-            socket
-                .send(Message::Text(job_frame.to_string().into()))
-                .await
-                .unwrap();
-
-            async fn wait_for_result<S>(socket: &mut WebSocketStream<S>) -> Value
-            where
-                S: AsyncRead + AsyncWrite + Unpin,
-            {
-                while let Some(Ok(Message::Text(text))) = socket.next().await {
-                    let value: Value = serde_json::from_str(&text).unwrap();
-                    if value["kind"] == "result" {
-                        return value;
-                    }
-                }
-                panic!("fake dispatch did not receive a result");
+            let mut requests = Vec::new();
+            while requests.len() < 2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 4096];
+                let size = stream.read(&mut buffer).await.unwrap();
+                requests.push(String::from_utf8_lossy(&buffer[..size]).to_string());
+                let body = r#"{"messages":[],"pending":false}"#;
+                let reply = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                stream.write_all(reply.as_bytes()).await.unwrap();
             }
-
-            let create_args = json!({
-                "run_id": job_id,
-                "tenant_id": "connector",
-                "repository": {"owner": "example", "name": "service", "clone_url": "https://example.com/service.git"},
-                "commit_sha": "0123456789abcdef0123456789abcdef01234567"
-            });
-            let create_frame = envelope(
-                "action",
-                Some(job_id.clone()),
-                json!({"job_id":job_id,"action_id":create_action_id,"verb":"create_sandbox","args":create_args}),
-            );
-            socket
-                .send(Message::Text(create_frame.to_string().into()))
-                .await
-                .unwrap();
-            let result = wait_for_result(&mut socket).await;
-            assert_eq!(result["payload"]["action_id"], create_action_id);
-
-            let deploy_args = json!({
-                "repository_sha": "0123456789abcdef0123456789abcdef01234567",
-                "manifests": {"type": "yaml", "path": "deploy/app.yaml"}
-            });
-            let deploy_frame = envelope(
-                "action",
-                Some(job_id.clone()),
-                json!({"job_id":job_id,"action_id":deploy_action_id,"verb":"deploy_revision","args":deploy_args}),
-            );
-            socket
-                .send(Message::Text(deploy_frame.to_string().into()))
-                .await
-                .unwrap();
-            let result = wait_for_result(&mut socket).await;
-            assert_eq!(result["payload"]["action_id"], deploy_action_id);
-
-            let observe_frame = envelope(
-                "action",
-                Some(job_id.clone()),
-                json!({"job_id":job_id,"action_id":observe_action_id,"verb":"observe_failure","args":{}}),
-            );
-            socket
-                .send(Message::Text(observe_frame.to_string().into()))
-                .await
-                .unwrap();
-            let result = wait_for_result(&mut socket).await;
-            assert_eq!(result["payload"]["action_id"], observe_action_id);
-
-            let patch_args = json!({
-                "repository_sha": "0123456789abcdef0123456789abcdef01234567",
-                "manifests": {"type": "yaml", "path": "deploy/app.yaml"},
-                "patch": {"unified_diff": "diff --git a/deploy/app.yaml b/deploy/app.yaml\n"}
-            });
-            let patch_frame = envelope(
-                "action",
-                Some(job_id.clone()),
-                json!({"job_id":job_id,"action_id":patch_action_id,"verb":"deploy_revision","args":patch_args}),
-            );
-            socket
-                .send(Message::Text(patch_frame.to_string().into()))
-                .await
-                .unwrap();
-            let result = wait_for_result(&mut socket).await;
-            assert_eq!(result["payload"]["action_id"], patch_action_id);
-
-            let validation_frame = envelope(
-                "action",
-                Some(job_id.clone()),
-                json!({"job_id":job_id,"action_id":validation_action_id,"verb":"run_validation","args":{"plan":{"commands":[],"health_checks":[]}}}),
-            );
-            socket
-                .send(Message::Text(validation_frame.to_string().into()))
-                .await
-                .unwrap();
-            let result = wait_for_result(&mut socket).await;
-            assert_eq!(result["payload"]["action_id"], validation_action_id);
-
-            let finalize_frame = envelope(
-                "action",
-                Some(job_id.clone()),
-                json!({"job_id":job_id,"action_id":finalize_action_id,"verb":"finalize_result","args":{"notes":"validated","require_patch":true}}),
-            );
-            socket
-                .send(Message::Text(finalize_frame.to_string().into()))
-                .await
-                .unwrap();
-            let result = wait_for_result(&mut socket).await;
-            assert_eq!(result["payload"]["action_id"], finalize_action_id);
-
-            let terminal = envelope(
-                "terminal",
-                Some(job_id.clone()),
-                json!({"job_id":job_id,"final_status":"failed","instructions":"discard_local_copy"}),
-            );
-            socket
-                .send(Message::Text(terminal.to_string().into()))
-                .await
-                .unwrap();
-            socket.close(None).await.unwrap();
+            requests
         });
+        let mut cfg = config();
+        cfg.dispatch_url = format!("http://{}", address);
+        cfg.polling_interval = Duration::from_millis(1);
+        let connector = Arc::new(Connector::new(cfg, FakeExecutor::default()));
+        let running = tokio::spawn(connector.clone().run_forever());
+        let requests = tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        running.abort();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.starts_with("GET /v1/tenants/connector/jobs/next")));
+    }
 
+    #[tokio::test]
+    async fn http_action_chain_posts_results_and_cleans_up_terminal() {
         let fake = FakeExecutor::default();
         let dir = tempdir().unwrap();
         let workspace = dir.path().join("workspace");
-        let mut connector_config = config();
-        connector_config.dispatch_url = format!("ws://{address}");
+        let job = job();
+        let job_id = job.job_id.clone();
+        let create = envelope(
+            "action",
+            Some(job_id.clone()),
+            json!({"job_id":job_id,"action_id":Uuid::new_v4().to_string(),"verb":"create_sandbox","args":{"run_id":"run-1","tenant_id":"connector","repository":{"owner":"example","name":"service","clone_url":"https://example.com/service.git"},"commit_sha":job.commit_sha}}),
+        );
+        let deploy = envelope(
+            "action",
+            Some(job_id.clone()),
+            json!({"job_id":job_id,"action_id":Uuid::new_v4().to_string(),"verb":"deploy_revision","args":{"repository_sha":job.commit_sha,"manifests":{"type":"yaml","path":"deploy/app.yaml"}}}),
+        );
+        let observe = envelope(
+            "action",
+            Some(job_id.clone()),
+            json!({"job_id":job_id,"action_id":Uuid::new_v4().to_string(),"verb":"observe_failure","args":{"timeout_seconds":1}}),
+        );
+        let patch_deploy = envelope(
+            "action",
+            Some(job_id.clone()),
+            json!({"job_id":job_id,"action_id":Uuid::new_v4().to_string(),"verb":"deploy_revision","args":{"repository_sha":job.commit_sha,"manifests":{"type":"yaml","path":"deploy/app.yaml"},"patch":{"files":[]}}}),
+        );
+        let validation = envelope(
+            "action",
+            Some(job_id.clone()),
+            json!({"job_id":job_id,"action_id":Uuid::new_v4().to_string(),"verb":"run_validation","args":{"plan":{"commands":[],"health_checks":[]}}}),
+        );
+        let finalize = envelope(
+            "action",
+            Some(job_id.clone()),
+            json!({"job_id":job_id,"action_id":Uuid::new_v4().to_string(),"verb":"finalize_result","args":{"notes":"validated","require_patch":true}}),
+        );
+        let terminal = envelope(
+            "terminal",
+            Some(job_id.clone()),
+            json!({"job_id":job_id,"final_status":"fix_finalized","instructions":"discard_local_copy"}),
+        );
+        let (url, server) = http_fixture(vec![
+            json!({"messages":[create],"pending":true}),
+            json!({"messages":[deploy],"idempotent_replay":false}),
+            json!({"messages":[observe],"idempotent_replay":false}),
+            json!({"messages":[patch_deploy],"idempotent_replay":false}),
+            json!({"messages":[validation],"idempotent_replay":false}),
+            json!({"messages":[finalize],"idempotent_replay":false}),
+            json!({"messages":[terminal],"idempotent_replay":false}),
+        ])
+        .await;
+        let mut cfg = config();
+        cfg.dispatch_url = url;
         let connector = Connector::with_cloner(
-            connector_config,
+            cfg,
             fake.clone(),
             FakeCloner {
                 workspace: workspace.clone(),
             },
         );
-        let _ = connector.run_once().await;
-        server.await.unwrap();
-        assert_eq!(fake.calls.lock().await.len(), 6);
-        assert!(auth_seen.load(std::sync::atomic::Ordering::SeqCst));
+        connector.run_once().await.unwrap();
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 7);
+        assert!(requests[0].starts_with("GET /v1/tenants/connector/jobs/next"));
+        assert!(requests[1].starts_with("POST /v1/results"));
+        assert!(requests[1].contains("Bearer test-token"));
+        assert!(requests[2].contains("POST /v1/results"));
         assert_eq!(*fake.destroyed.lock().await, 1);
         assert!(!workspace.exists());
+    }
+
+    #[tokio::test]
+    async fn http_auth_and_malformed_responses_fail_safely() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            let _ = stream.read(&mut buf).await.unwrap();
+            let body = "not-json";
+            let reply = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let mut cfg = config();
+        cfg.dispatch_url = format!("http://{}", address);
+        cfg.token = "bad".into();
+        let error = Connector::new(cfg, FakeExecutor::default())
+            .run_once()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("authentication"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_escalation_terminal_also_cleans_up() {
+        let fake = FakeExecutor::default();
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let job = job();
+        let job_id = job.job_id.clone();
+        let create = envelope(
+            "action",
+            Some(job_id.clone()),
+            json!({"job_id":job_id,"action_id":Uuid::new_v4().to_string(),"verb":"create_sandbox","args":{"run_id":"run-2","tenant_id":"connector","repository":{"owner":"example","name":"service","clone_url":"https://example.com/service.git"},"commit_sha":job.commit_sha}}),
+        );
+        let terminal = envelope(
+            "terminal",
+            Some(job_id.clone()),
+            json!({"job_id":job_id,"final_status":"escalated","instructions":"discard_local_copy"}),
+        );
+        let (url, server) = http_fixture(vec![
+            json!({"messages":[create],"pending":true}),
+            json!({"messages":[terminal],"idempotent_replay":false}),
+        ])
+        .await;
+        let mut cfg = config();
+        cfg.dispatch_url = url;
+        let connector = Connector::with_cloner(
+            cfg,
+            fake.clone(),
+            FakeCloner {
+                workspace: workspace.clone(),
+            },
+        );
+        connector.run_once().await.unwrap();
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(*fake.destroyed.lock().await, 1);
+        assert!(!workspace.exists());
+    }
+
+    #[tokio::test]
+    async fn http_forbidden_and_malformed_success_bodies_are_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            let _ = stream.read(&mut buf).await.unwrap();
+            let body = "{}";
+            let reply = format!(
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let mut cfg = config();
+        cfg.dispatch_url = format!("http://{}", address);
+        let error = Connector::new(cfg, FakeExecutor::default())
+            .run_once()
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("authentication"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_dispatch_failure_is_bounded_by_reconnect_attempts() {
+        let connector = Connector::new(config(), FakeExecutor::default());
+        let started = std::time::Instant::now();
+        let result = connector.run_reconnect_attempts(2).await;
+        assert!(result.is_err());
+        assert!(started.elapsed() >= Duration::from_millis(100));
     }
 
     #[tokio::test]
@@ -1465,36 +1630,5 @@ mod tests {
         let value: Value = serde_json::from_str(&frames[0]).unwrap();
         assert_eq!(value["kind"], "error");
         assert_eq!(value["payload"]["code"], "malformed_envelope");
-    }
-
-    #[tokio::test]
-    async fn disconnect_reconnects_with_backoff() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tokio::net::TcpListener;
-        use tokio_tungstenite::accept_async;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let accepted = Arc::new(AtomicUsize::new(0));
-        let server_count = accepted.clone();
-        let server = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut socket = accept_async(stream).await.unwrap();
-                server_count.fetch_add(1, Ordering::SeqCst);
-                socket.close(None).await.unwrap();
-            }
-        });
-
-        let fake = FakeExecutor::default();
-        let mut connector_config = config();
-        connector_config.dispatch_url = format!("ws://{address}");
-        let connector = Connector::new(connector_config, fake);
-        let started = std::time::Instant::now();
-        let result = connector.run_reconnect_attempts(2).await;
-        assert!(result.is_err());
-        assert_eq!(accepted.load(Ordering::SeqCst), 2);
-        assert!(started.elapsed() >= Duration::from_millis(100));
-        server.await.unwrap();
     }
 }
