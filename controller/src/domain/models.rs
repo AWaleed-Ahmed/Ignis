@@ -125,6 +125,12 @@ pub struct FidelityReport {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenderedFile {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployRevisionResponse {
     pub sandbox_id: String,
     pub status: String,
@@ -138,6 +144,8 @@ pub struct DeployRevisionResponse {
     pub tool_versions: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rendered_files: Vec<RenderedFile>,
     pub deployed_at: DateTime<Utc>,
 }
 

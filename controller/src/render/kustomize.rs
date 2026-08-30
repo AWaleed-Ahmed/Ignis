@@ -36,6 +36,7 @@ pub fn render_kustomize(
             return Ok(RenderResult {
                 yaml: String::from_utf8_lossy(&out.stdout).to_string(),
                 render_path: format!("kustomize:{overlay}"),
+                files: Vec::new(),
             });
         }
         Ok(out) => {
@@ -51,6 +52,7 @@ pub fn render_kustomize(
                     return Ok(RenderResult {
                         yaml: String::from_utf8_lossy(&out2.stdout).to_string(),
                         render_path: format!("kustomize:{overlay}"),
+                        files: Vec::new(),
                     });
                 }
                 let err2 = String::from_utf8_lossy(&out2.stderr).to_string();
@@ -68,6 +70,7 @@ pub fn render_kustomize(
             Ok(RenderResult {
                 yaml: fallback,
                 render_path: format!("kustomize-fallback:{overlay}"),
+                files: Vec::new(),
             })
         }
         Err(e) => Err(DomainError::RenderFailed(e.to_string())),

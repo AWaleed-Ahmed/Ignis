@@ -1115,6 +1115,29 @@ fn validate_response(verb: &str, value: &Value) -> Result<(), ConnectorError> {
                     "deploy_revision response is incomplete".into(),
                 ));
             }
+            // rendered_files is optional (added in contracts-v1.1.0). When present it must be
+            // an array of {path, content} objects; when absent, accept for backward compatibility.
+            if let Some(rendered_files) = map.get("rendered_files") {
+                let arr = rendered_files.as_array().ok_or_else(|| {
+                    ConnectorError::Malformed(
+                        "deploy_revision.rendered_files must be an array".into(),
+                    )
+                })?;
+                for (i, item) in arr.iter().enumerate() {
+                    let file = item.as_object().ok_or_else(|| {
+                        ConnectorError::Malformed(format!(
+                            "deploy_revision.rendered_files[{i}] must be an object"
+                        ))
+                    })?;
+                    if file.get("path").and_then(Value::as_str).is_none()
+                        || file.get("content").and_then(Value::as_str).is_none()
+                    {
+                        return Err(ConnectorError::Malformed(format!(
+                            "deploy_revision.rendered_files[{i}] requires string path and content"
+                        )));
+                    }
+                }
+            }
         }
         "observe_failure" => {
             if map.get("signature").is_none()

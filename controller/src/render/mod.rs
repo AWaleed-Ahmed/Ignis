@@ -4,11 +4,12 @@ pub mod kustomize;
 pub mod yaml;
 
 use crate::domain::errors::DomainError;
-use crate::domain::models::ManifestSpec;
+use crate::domain::models::{ManifestSpec, RenderedFile};
 
 pub struct RenderResult {
     pub yaml: String,
     pub render_path: String,
+    pub files: Vec<RenderedFile>,
 }
 
 pub fn render(workspace: &str, manifests: &ManifestSpec) -> Result<RenderResult, DomainError> {
