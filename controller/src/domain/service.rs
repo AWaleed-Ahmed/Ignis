@@ -209,6 +209,7 @@ impl SandboxService {
             fidelity,
             tool_versions: Some(tool_versions),
             message: Some(format!("rendered via {}", rendered.render_path)),
+            rendered_files: rendered.files,
             deployed_at: now,
         })
     }

@@ -29,6 +29,35 @@ def test_deploy_yaml_broken_probe():
         assert body["rendered_artifact_ids"], body
         assert "fidelity" in body and "score" in body["fidelity"], body
         assert isinstance(body["fidelity"]["material_gaps"], list), body
+        assert isinstance(body.get("rendered_files"), list), body
+    finally:
+        cleanup(client, sid)
+
+
+def test_deploy_rendered_files_matches_workspace():
+    """rendered_files must list the files actually rendered, with real content."""
+    client = require_controller()
+    created = expect_ok(create_sandbox(client, "deploy-rendered-files"), "create")
+    sid = created["sandbox_id"]
+    try:
+        resp = client.deploy(
+            sid,
+            {
+                "repository_sha": "abcdef1234567",
+                "workspace_path": str(scenario("probe_port_mismatch")),
+                "manifests": {"type": "yaml", "path": "deploy/manifests"},
+            },
+        )
+        body = expect_ok(resp, "deploy-rendered-files")
+        files = body.get("rendered_files")
+        assert isinstance(files, list) and files, body
+        paths = [f["path"] for f in files]
+        assert "deploy/manifests/broken.yaml" in paths, paths
+        entry = next(f for f in files if f["path"] == "deploy/manifests/broken.yaml")
+        assert isinstance(entry["content"], str) and entry["content"].strip(), entry
+        assert "readinessProbe" in entry["content"], entry["content"]
+        for f in files:
+            assert set(f.keys()) == {"path", "content"}, f
     finally:
         cleanup(client, sid)
 
@@ -144,6 +173,7 @@ def test_deploy_redeploy_overwrites():
 
 TESTS = [
     ("deploy_yaml_broken", test_deploy_yaml_broken_probe, "Deploy broken YAML scenario"),
+    ("deploy_rendered_files", test_deploy_rendered_files_matches_workspace, "rendered_files matches workspace"),
     ("deploy_missing_ws", test_deploy_missing_workspace_fails, "Missing workspace fails"),
     ("deploy_missing_path", test_deploy_missing_manifest_path_fails, "Missing manifest path fails"),
     ("deploy_bad_type", test_deploy_unknown_manifest_type_fails, "Unknown renderer type fails"),

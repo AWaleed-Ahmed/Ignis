@@ -39,6 +39,19 @@
       "description": "Client tool versions used during deploy (helm/kubectl/kustomize)"
     },
     "message": { "type": "string" },
+    "rendered_files": {
+      "type": "array",
+      "description": "Files actually rendered and applied for this deploy call. Bounded to the rendered output of this specific deploy; never a directory listing. Paths are relative to the workspace root. Added in contracts-v1.1.0; optional for backward compatibility.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "content"],
+        "properties": {
+          "path": { "type": "string" },
+          "content": { "type": "string" }
+        }
+      }
+    },
     "deployed_at": { "type": "string", "format": "date-time" }
   }
 }

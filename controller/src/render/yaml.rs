@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 use crate::domain::errors::DomainError;
-use crate::domain::models::ManifestSpec;
+use crate::domain::models::{ManifestSpec, RenderedFile};
 use crate::render::RenderResult;
 
 pub fn render_yaml(workspace: &str, manifests: &ManifestSpec) -> Result<RenderResult, DomainError> {
@@ -12,7 +12,8 @@ pub fn render_yaml(workspace: &str, manifests: &ManifestSpec) -> Result<RenderRe
         .path
         .as_deref()
         .ok_or_else(|| DomainError::InvalidRequest("manifests.path required for yaml".into()))?;
-    let root = PathBuf::from(workspace).join(rel);
+    let workspace_root = PathBuf::from(workspace);
+    let root = workspace_root.join(rel);
     if !root.exists() {
         return Err(DomainError::RenderFailed(format!(
             "yaml path not found: {}",
@@ -20,9 +21,9 @@ pub fn render_yaml(workspace: &str, manifests: &ManifestSpec) -> Result<RenderRe
         )));
     }
 
-    let mut docs = Vec::new();
+    let mut sources: Vec<PathBuf> = Vec::new();
     if root.is_file() {
-        docs.push(read_file(&root)?);
+        sources.push(root.clone());
     } else {
         let mut files: Vec<PathBuf> = WalkDir::new(&root)
             .into_iter()
@@ -36,18 +37,33 @@ pub fn render_yaml(workspace: &str, manifests: &ManifestSpec) -> Result<RenderRe
             })
             .collect();
         files.sort();
-        for f in files {
-            docs.push(read_file(&f)?);
-        }
+        sources = files;
     }
 
-    if docs.is_empty() {
+    if sources.is_empty() {
         return Err(DomainError::RenderFailed("no yaml manifests found".into()));
+    }
+
+    let mut docs = Vec::new();
+    let mut files = Vec::new();
+    for path in &sources {
+        let content = read_file(path)?;
+        let rel_path = path
+            .strip_prefix(&workspace_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        files.push(RenderedFile {
+            path: rel_path,
+            content: content.clone(),
+        });
+        docs.push(content);
     }
 
     Ok(RenderResult {
         yaml: docs.join("\n---\n"),
         render_path: format!("yaml:{}", rel),
+        files,
     })
 }
 

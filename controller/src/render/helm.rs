@@ -116,6 +116,7 @@ fn render_helm_sync(
     Ok(RenderResult {
         yaml,
         render_path: format!("helm:{}:{}", chart, release),
+        files: Vec::new(),
     })
 }
 
@@ -148,5 +149,6 @@ fn fallback_chart_concat(
     Ok(RenderResult {
         yaml: docs.join("\n---\n"),
         render_path: format!("helm-fallback:{}:{}", chart, release),
+        files: Vec::new(),
     })
 }
