@@ -34,6 +34,7 @@ pub struct ConnectorConfig {
     pub controller_url: String,
     pub tenant_id: String,
     pub polling_interval: Duration,
+    pub http_timeout: Duration,
 }
 
 impl ConnectorConfig {
@@ -58,6 +59,22 @@ impl ConnectorConfig {
                 "RAPHAEL_CONNECTOR_DISPATCH_URL must use http:// or https://"
             ));
         }
+        let http_timeout_seconds = env::var("RAPHAEL_CONNECTOR_HTTP_TIMEOUT_SECONDS")
+            .ok()
+            .map(|value| {
+                value.parse::<u64>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "RAPHAEL_CONNECTOR_HTTP_TIMEOUT_SECONDS must be a positive integer"
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or(30);
+        if http_timeout_seconds == 0 {
+            return Err(anyhow::anyhow!(
+                "RAPHAEL_CONNECTOR_HTTP_TIMEOUT_SECONDS must be a positive integer"
+            ));
+        }
         Ok(Some(Self {
             dispatch_url,
             token,
@@ -71,6 +88,7 @@ impl ConnectorConfig {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or(1000),
             ),
+            http_timeout: Duration::from_secs(http_timeout_seconds),
         }))
     }
 }
@@ -170,7 +188,6 @@ pub struct LocalJob {
     job: Job,
     workspace_path: PathBuf,
     sandbox_id: Option<String>,
-    last_activity: DateTime<Utc>,
     terminal: bool,
     processed_actions: HashMap<String, CachedAction>,
 }
@@ -371,7 +388,10 @@ where
     }
 
     pub async fn run_once(&self) -> Result<(), ConnectorError> {
-        let client = Client::new();
+        let client = Client::builder()
+            .timeout(self.config.http_timeout)
+            .build()
+            .map_err(|e| ConnectorError::Execution(e.to_string()))?;
         let url = format!(
             "{}/v1/tenants/{}/jobs/next",
             self.config.dispatch_url.trim_end_matches('/'),
@@ -550,49 +570,6 @@ where
         Ok(())
     }
 
-    async fn handle_text(&self, text: &str) -> Vec<String> {
-        let parsed = serde_json::from_str::<Value>(text)
-            .map_err(|e| ConnectorError::Malformed(e.to_string()));
-        match parsed {
-            Ok(value) => match self.handle_value(value).await {
-                Ok(values) => values,
-                Err(error) => vec![self.error_frame(None, error_code(&error), error.to_string())],
-            },
-            Err(error) => vec![self.error_frame(None, "malformed_envelope", error.to_string())],
-        }
-    }
-
-    async fn handle_value(&self, value: Value) -> Result<Vec<String>, ConnectorError> {
-        let envelope = parse_envelope(&value)?;
-        let ack = self.ack_frame(&envelope.message_id);
-        let mut responses = vec![ack];
-        match envelope.kind.as_str() {
-            "job" => {
-                let job: Job = serde_json::from_value(envelope.payload)
-                    .map_err(|e| ConnectorError::Malformed(e.to_string()))?;
-                responses.extend(self.handle_job(job).await?);
-            }
-            "action" => {
-                let action: Action = serde_json::from_value(envelope.payload)
-                    .map_err(|e| ConnectorError::Malformed(e.to_string()))?;
-                responses.extend(self.handle_action(action).await?);
-            }
-            "terminal" => {
-                let terminal: Terminal = serde_json::from_value(envelope.payload)
-                    .map_err(|e| ConnectorError::Malformed(e.to_string()))?;
-                responses.extend(self.handle_terminal(terminal).await?);
-            }
-            "ack" => {}
-            "error" => {
-                warn!(payload = %envelope.payload, "dispatch sent connector error");
-            }
-            _ => {
-                return Err(ConnectorError::Unsupported(envelope.kind));
-            }
-        }
-        Ok(responses)
-    }
-
     async fn handle_job(&self, job: Job) -> Result<Vec<String>, ConnectorError> {
         validate_job(&job)?;
         let job_id = job.job_id.clone();
@@ -607,7 +584,6 @@ where
             job,
             workspace_path: workspace,
             sandbox_id: None,
-            last_activity: Utc::now(),
             terminal: false,
             processed_actions: HashMap::new(),
         };
@@ -643,7 +619,6 @@ where
             }
             return Ok(vec![cached.frame.clone()]);
         }
-        local.last_activity = Utc::now();
         let result = match action.verb.as_str() {
             "create_sandbox" => {
                 let value = self.executor.execute(&local.job, local, &action).await?;
@@ -710,42 +685,6 @@ where
             }
         }
         Ok(Vec::new())
-    }
-
-    async fn reap_expired(&self) -> Vec<String> {
-        let now = Utc::now();
-        let mut expired = Vec::new();
-        let mut jobs = self.jobs.lock().await;
-        for (job_id, local) in jobs.iter_mut() {
-            let ttl = local.job.lease_ttl_seconds.unwrap_or(0);
-            if ttl >= 30 && (now - local.last_activity).num_seconds() > ttl as i64 {
-                local.terminal = true;
-                expired.push(self.error_frame(
-                    Some(job_id.clone()),
-                    "job_lease_expired",
-                    "connector abandoned expired job".into(),
-                ));
-            }
-        }
-        let ids: Vec<String> = jobs
-            .iter()
-            .filter_map(|(id, local)| local.terminal.then_some(id.clone()))
-            .collect();
-        for id in ids {
-            if let Some(local) = jobs.remove(&id) {
-                if let Err(error) = self.executor.destroy(&local).await {
-                    warn!(job_id = %id, error = %error, "expired sandbox cleanup failed");
-                }
-                if let Err(error) = tokio::fs::remove_dir_all(&local.workspace_path).await {
-                    warn!(job_id = %id, error = %error, "expired workspace cleanup failed");
-                }
-            }
-        }
-        expired
-    }
-
-    fn ack_frame(&self, message_id: &str) -> String {
-        envelope("ack", None, json!({"acked_message_id": message_id})).to_string()
     }
 
     fn error_frame(&self, job_id: Option<String>, code: &str, message: String) -> String {
@@ -1258,6 +1197,7 @@ mod tests {
             controller_url: "http://127.0.0.1:8090".into(),
             tenant_id: "connector".into(),
             polling_interval: Duration::from_millis(1),
+            http_timeout: Duration::from_secs(30),
         }
     }
 
@@ -1317,6 +1257,16 @@ mod tests {
         )
     }
 
+    fn action_from_envelope(value: Value) -> Action {
+        let envelope = parse_envelope(&value).unwrap();
+        serde_json::from_value(envelope.payload).unwrap()
+    }
+
+    fn terminal_from_envelope(value: Value) -> Terminal {
+        let envelope = parse_envelope(&value).unwrap();
+        serde_json::from_value(envelope.payload).unwrap()
+    }
+
     #[test]
     fn rejects_credentialed_repository_urls() {
         for clone_url in [
@@ -1350,17 +1300,22 @@ mod tests {
                 job,
                 workspace_path: dir.path().to_path_buf(),
                 sandbox_id: Some("sb-test".into()),
-                last_activity: Utc::now(),
                 terminal: false,
                 processed_actions: HashMap::new(),
             },
         );
         let action_id = Uuid::new_v4().to_string();
         let frame = action(&job_id, &action_id, "observe_failure", json!({}));
-        let first = connector.handle_value(frame.clone()).await.unwrap();
-        let second = connector.handle_value(frame).await.unwrap();
+        let first = connector
+            .handle_action(action_from_envelope(frame.clone()))
+            .await
+            .unwrap();
+        let second = connector
+            .handle_action(action_from_envelope(frame))
+            .await
+            .unwrap();
         assert_eq!(fake.calls.lock().await.len(), 1);
-        assert_eq!(first[1], second[1]);
+        assert_eq!(first[0], second[0]);
     }
 
     #[tokio::test]
@@ -1376,29 +1331,33 @@ mod tests {
                 job,
                 workspace_path: dir.path().to_path_buf(),
                 sandbox_id: Some("sb-test".into()),
-                last_activity: Utc::now(),
                 terminal: false,
                 processed_actions: HashMap::new(),
             },
         );
         let action_id = Uuid::new_v4().to_string();
         let first = connector
-            .handle_value(action(&job_id, &action_id, "observe_failure", json!({})))
+            .handle_action(action_from_envelope(action(
+                &job_id,
+                &action_id,
+                "observe_failure",
+                json!({}),
+            )))
             .await
             .unwrap();
         let second = connector
-            .handle_value(action(
+            .handle_action(action_from_envelope(action(
                 &job_id,
                 &action_id,
                 "observe_failure",
                 json!({"timeout_seconds": 30}),
-            ))
+            )))
             .await
             .unwrap();
         assert_eq!(fake.calls.lock().await.len(), 1);
-        assert_eq!(first.len(), 2);
-        assert_eq!(second.len(), 2);
-        let error: Value = serde_json::from_str(&second[1]).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 1);
+        let error: Value = serde_json::from_str(&second[0]).unwrap();
         assert_eq!(error["kind"], "error");
         assert_eq!(error["payload"]["code"], "malformed_envelope");
     }
@@ -1418,7 +1377,6 @@ mod tests {
                 job,
                 workspace_path: workspace.clone(),
                 sandbox_id: Some("sb-test".into()),
-                last_activity: Utc::now(),
                 terminal: false,
                 processed_actions: HashMap::new(),
             },
@@ -1428,7 +1386,10 @@ mod tests {
             Some(job_id.clone()),
             json!({"job_id":job_id,"final_status":"failed","instructions":"discard_local_copy"}),
         );
-        connector.handle_value(terminal).await.unwrap();
+        connector
+            .handle_terminal(terminal_from_envelope(terminal))
+            .await
+            .unwrap();
         assert_eq!(*fake.destroyed.lock().await, 1);
         assert!(!workspace.exists());
     }
@@ -1646,12 +1607,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_envelope_returns_error_frame() {
-        let connector = Connector::new(config(), FakeExecutor::default());
-        let frames = connector.handle_text("{not-json").await;
-        assert_eq!(frames.len(), 1);
-        let value: Value = serde_json::from_str(&frames[0]).unwrap();
-        assert_eq!(value["kind"], "error");
-        assert_eq!(value["payload"]["code"], "malformed_envelope");
+    async fn http_malformed_response_is_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            let _ = stream.read(&mut buf).await.unwrap();
+            let body = "{}";
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        });
+        let mut cfg = config();
+        cfg.dispatch_url = format!("http://{}", address);
+        let error = Connector::new(cfg, FakeExecutor::default())
+            .run_once()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ConnectorError::Malformed(_)));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn http_request_timeout_is_enforced() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            let _ = stream.read(&mut buf).await.unwrap();
+            sleep(Duration::from_millis(200)).await;
+        });
+        let mut cfg = config();
+        cfg.dispatch_url = format!("http://{}", address);
+        cfg.http_timeout = Duration::from_millis(25);
+        let started = std::time::Instant::now();
+        let error = Connector::new(cfg, FakeExecutor::default())
+            .run_once()
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ConnectorError::Execution(_)));
+        assert!(started.elapsed() < Duration::from_millis(150));
+        server.await.unwrap();
     }
 }

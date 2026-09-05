@@ -40,7 +40,7 @@ The controller defaults to `127.0.0.1:8090` and uses the mock backend unless con
 
 ## Outbound connector
 
-The connector is opt-in. Set `RAPHAEL_CONNECTOR_DISPATCH_URL` to a `ws://` or `wss://` dispatch endpoint and provide `RAPHAEL_CONNECTOR_TOKEN`; the token is required, has no default, and is sent only as a Bearer credential on the outbound WebSocket handshake. `RAPHAEL_CONNECTOR_CONTROLLER_URL` may point to the local controller and defaults to `http://127.0.0.1:8090`; `RAPHAEL_CONNECTOR_TENANT_ID` defaults to `connector`.
+The connector is opt-in. Set `RAPHAEL_CONNECTOR_DISPATCH_URL` to an `http://` or `https://` dispatch endpoint and provide `RAPHAEL_CONNECTOR_TOKEN`; the token is required, has no default, and is sent only as a Bearer credential on outbound polling and result requests. `RAPHAEL_CONNECTOR_CONTROLLER_URL` may point to the local controller and defaults to `http://127.0.0.1:8090`; `RAPHAEL_CONNECTOR_TENANT_ID` defaults to `connector`; `RAPHAEL_CONNECTOR_POLL_INTERVAL_MS` defaults to `1000`; and `RAPHAEL_CONNECTOR_HTTP_TIMEOUT_SECONDS` defaults to `30` and must be a positive integer.
 
 After connection, the connector validates typed envelopes and the six closed-allowlist verbs, clones each job repository at its requested commit, executes only the corresponding local controller HTTP operation, caches completed `action_id` results, reconnects with bounded exponential backoff, and cleans up the sandbox/workspace on a terminal `discard_local_copy` instruction. It never receives or uses a GitHub token, LLM key, production kubeconfig, prompt, or reasoning instruction.
 
