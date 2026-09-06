@@ -170,12 +170,6 @@ struct ResultPayload {
     error: Option<ErrorBody>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct ErrorPayload {
-    code: String,
-    message: String,
-}
-
 #[derive(Debug, Clone)]
 struct CachedAction {
     verb: String,
@@ -596,26 +590,32 @@ where
         validate_action(&action)?;
         let mut jobs = self.jobs.lock().await;
         let Some(local) = jobs.get_mut(&action.job_id) else {
-            return Ok(vec![self.error_frame(
-                Some(action.job_id),
-                "internal_error",
-                "action references unknown job".into(),
+            return Ok(vec![self.result_frame(
+                &action,
+                "failed",
+                None,
+                Some(ErrorBody {
+                    code: "internal_error".into(),
+                    message: "action references unknown job".into(),
+                }),
             )]);
         };
         if local.terminal {
-            return Ok(vec![self.error_frame(
-                Some(action.job_id),
-                "job_lease_expired",
-                "job is already terminal".into(),
+            return Ok(vec![self.result_frame(
+                &action,
+                "failed",
+                None,
+                Some(ErrorBody {
+                    code: "job_lease_expired".into(),
+                    message: "job is already terminal".into(),
+                }),
             )]);
         }
         if let Some(cached) = local.processed_actions.get(&action.action_id) {
             if cached.verb != action.verb || cached.args != action.args {
-                return Ok(vec![self.error_frame(
-                    Some(action.job_id.clone()),
-                    "malformed_envelope",
+                return Err(ConnectorError::Malformed(
                     "action_id replay payload mismatch".into(),
-                )]);
+                ));
             }
             return Ok(vec![cached.frame.clone()]);
         }
@@ -685,21 +685,6 @@ where
             }
         }
         Ok(Vec::new())
-    }
-
-    fn error_frame(&self, job_id: Option<String>, code: &str, message: String) -> String {
-        envelope(
-            "error",
-            job_id,
-            serde_json::to_value(ErrorPayload {
-                code: code.to_string(),
-                message,
-            })
-            .unwrap_or_else(
-                |_| json!({"code": "internal_error", "message": "error serialization failed"}),
-            ),
-        )
-        .to_string()
     }
 
     fn result_frame(
@@ -1353,13 +1338,10 @@ mod tests {
                 json!({"timeout_seconds": 30}),
             )))
             .await
-            .unwrap();
+            .unwrap_err();
         assert_eq!(fake.calls.lock().await.len(), 1);
         assert_eq!(first.len(), 1);
-        assert_eq!(second.len(), 1);
-        let error: Value = serde_json::from_str(&second[0]).unwrap();
-        assert_eq!(error["kind"], "error");
-        assert_eq!(error["payload"]["code"], "malformed_envelope");
+        assert!(matches!(second, ConnectorError::Malformed(_)));
     }
 
     #[tokio::test]
@@ -1504,6 +1486,45 @@ mod tests {
         assert!(requests[2].contains("POST /v1/results"));
         assert_eq!(*fake.destroyed.lock().await, 1);
         assert!(!workspace.exists());
+    }
+
+    #[tokio::test]
+    async fn http_unknown_action_posts_attributable_failed_result() {
+        let fake = FakeExecutor::default();
+        let job_id = Uuid::new_v4().to_string();
+        let action_id = Uuid::new_v4().to_string();
+        let unknown_action = action(
+            &job_id,
+            &action_id,
+            "deploy_revision",
+            json!({
+                "repository_sha": "0123456789abcdef0123456789abcdef01234567",
+                "manifests": {"type": "yaml", "path": "deploy/app.yaml"}
+            }),
+        );
+        let (url, server) = http_fixture(vec![
+            json!({"messages":[unknown_action],"pending":true}),
+            json!({"messages":[],"idempotent_replay":false}),
+        ])
+        .await;
+        let mut cfg = config();
+        cfg.dispatch_url = url;
+        Connector::new(cfg, fake).run_once().await.unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let posted = requests[1]
+            .split("\r\n\r\n")
+            .nth(1)
+            .expect("POST request body must be present");
+        let result: Value = serde_json::from_str(posted).unwrap();
+        assert_eq!(result["kind"], "result");
+        assert_eq!(result["job_id"], job_id);
+        assert_eq!(result["payload"]["job_id"], job_id);
+        assert_eq!(result["payload"]["action_id"], action_id);
+        assert_eq!(result["payload"]["verb"], "deploy_revision");
+        assert_eq!(result["payload"]["status"], "failed");
+        assert_eq!(result["payload"]["error"]["code"], "internal_error");
     }
 
     #[tokio::test]
