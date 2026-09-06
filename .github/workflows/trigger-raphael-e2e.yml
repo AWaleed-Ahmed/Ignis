@@ -1,0 +1,32 @@
+name: Trigger Raphael cross-repository E2E
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require cross-repository dispatch token
+        # Use a fine-grained PAT restricted to AWaleed-Ahmed/Raphael only.
+        # GitHub requires Contents: write to create a repository_dispatch
+        # event; do not substitute a broad classic `repo` token here.
+        env:
+          RAPHAEL_REPOSITORY_DISPATCH_TOKEN: ${{ secrets.RAPHAEL_REPOSITORY_DISPATCH_TOKEN }}
+        run: |
+          if [ -z "$RAPHAEL_REPOSITORY_DISPATCH_TOKEN" ]; then
+            echo "::error::Set RAPHAEL_REPOSITORY_DISPATCH_TOKEN in Ignis Actions secrets. It must be able to dispatch workflows in AWaleed-Ahmed/Raphael."
+            exit 1
+          fi
+
+      - name: Trigger Raphael E2E for this exact Ignis revision
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.RAPHAEL_REPOSITORY_DISPATCH_TOKEN }}
+          repository: AWaleed-Ahmed/Raphael
+          event-type: ignis-main-updated
+          client-payload: '{"ignis_ref":"${{ github.sha }}","source":"ignis-main"}'
