@@ -122,6 +122,14 @@ impl SandboxRegistry {
             .and_then(|g| g.get(sandbox_id).cloned())
     }
 
+    /// Internal recovery lookup; no HTTP route exposes this registry method.
+    pub fn get_by_run_id(&self, run_id: &str) -> Option<SandboxRecord> {
+        self.inner
+            .read()
+            .ok()
+            .and_then(|g| g.values().find(|record| record.run_id == run_id).cloned())
+    }
+
     pub fn update<F>(&self, sandbox_id: &str, mutator: F) -> Result<SandboxRecord, String>
     where
         F: FnOnce(&mut SandboxRecord),

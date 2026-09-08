@@ -12,17 +12,39 @@ use crate::k8s::{ClusterBackend, DestroyOutcome, NamespaceSpec};
 use crate::observe;
 use crate::policy;
 use crate::render;
+use crate::state::recovery::RecoveryStore;
 use crate::state::registry::{SandboxRecord, SandboxRegistry, SandboxStatus};
 use crate::validate;
 
 pub struct SandboxService {
     backend: Arc<dyn ClusterBackend>,
     registry: Arc<SandboxRegistry>,
+    recovery: Arc<RecoveryStore>,
 }
 
 impl SandboxService {
     pub fn new(backend: Arc<dyn ClusterBackend>, registry: Arc<SandboxRegistry>) -> Self {
-        Self { backend, registry }
+        Self {
+            backend,
+            registry,
+            recovery: Arc::new(RecoveryStore::in_memory()),
+        }
+    }
+
+    pub fn with_recovery(
+        backend: Arc<dyn ClusterBackend>,
+        registry: Arc<SandboxRegistry>,
+        recovery: Arc<RecoveryStore>,
+    ) -> Self {
+        Self {
+            backend,
+            registry,
+            recovery,
+        }
+    }
+
+    pub fn recovery(&self) -> Arc<RecoveryStore> {
+        self.recovery.clone()
     }
 
     pub fn backend_name(&self) -> &'static str {

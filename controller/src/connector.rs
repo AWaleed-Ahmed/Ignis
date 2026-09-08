@@ -9,12 +9,14 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::gitclone::clone_at_sha;
+use crate::state::recovery::{ActionReceipt, ConnectorJobRecord, RecoveryStore};
 
 const PROTOCOL_VERSION: &str = "1.0";
 const MAX_RECONNECT_SECONDS: u64 = 30;
@@ -250,11 +252,20 @@ impl ControllerExecutor {
         }
     }
 
-    async fn post(&self, path: &str, body: Value) -> Result<Value, ConnectorError> {
-        let response = self
+    async fn post(
+        &self,
+        path: &str,
+        body: Value,
+        action_id: Option<&str>,
+    ) -> Result<Value, ConnectorError> {
+        let mut request = self
             .client
             .post(format!("{}{}", self.base_url, path))
-            .json(&body)
+            .json(&body);
+        if let Some(action_id) = action_id {
+            request = request.header("x-raphael-connector-action-id", action_id);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| ConnectorError::Execution(e.to_string()))?;
@@ -312,7 +323,7 @@ impl ActionExecutor for ControllerExecutor {
                 endpoint_suffix(&action.verb)?
             )
         };
-        let result = self.post(&path, body).await?;
+        let result = self.post(&path, body, Some(&action.action_id)).await?;
         validate_response(&action.verb, &result)?;
         let _ = job;
         Ok(result)
@@ -324,7 +335,7 @@ impl ActionExecutor for ControllerExecutor {
         };
         let path = format!("/v1/sandboxes/{sandbox_id}/destroy");
         let result = self
-            .post(&path, json!({"reason": "connector_terminal"}))
+            .post(&path, json!({"reason": "connector_terminal"}), None)
             .await?;
         validate_response("destroy_sandbox", &result)
     }
@@ -335,12 +346,13 @@ pub struct Connector<E = ControllerExecutor, C = GitWorkspaceCloner> {
     executor: Arc<E>,
     cloner: Arc<C>,
     jobs: Arc<Mutex<HashMap<String, LocalJob>>>,
+    recovery: Arc<RecoveryStore>,
 }
 
 impl Connector<ControllerExecutor, GitWorkspaceCloner> {
-    pub fn from_config(config: ConnectorConfig) -> Self {
+    pub fn from_config(config: ConnectorConfig, recovery: Arc<RecoveryStore>) -> Self {
         let executor = ControllerExecutor::new(config.controller_url.clone());
-        Self::new(config, executor)
+        Self::with_recovery(config, executor, GitWorkspaceCloner, recovery)
     }
 }
 
@@ -349,7 +361,12 @@ where
     E: ActionExecutor + 'static,
 {
     pub fn new(config: ConnectorConfig, executor: E) -> Self {
-        Self::with_cloner(config, executor, GitWorkspaceCloner)
+        Self::with_recovery(
+            config,
+            executor,
+            GitWorkspaceCloner,
+            Arc::new(RecoveryStore::in_memory()),
+        )
     }
 }
 
@@ -359,12 +376,79 @@ where
     C: WorkspaceCloner + 'static,
 {
     pub fn with_cloner(config: ConnectorConfig, executor: E, cloner: C) -> Self {
+        Self::with_recovery(
+            config,
+            executor,
+            cloner,
+            Arc::new(RecoveryStore::in_memory()),
+        )
+    }
+
+    pub fn with_recovery(
+        config: ConnectorConfig,
+        executor: E,
+        cloner: C,
+        recovery: Arc<RecoveryStore>,
+    ) -> Self {
         Self {
             config,
             executor: Arc::new(executor),
             cloner: Arc::new(cloner),
             jobs: Arc::new(Mutex::new(HashMap::new())),
+            recovery,
         }
+    }
+
+    pub async fn rehydrate(&self) -> Result<(), ConnectorError> {
+        for record in self.recovery.active_jobs() {
+            self.restore_job(&record.job_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn restore_job(&self, job_id: &str) -> Result<bool, ConnectorError> {
+        if self.jobs.lock().await.contains_key(job_id) {
+            return Ok(true);
+        }
+        let Some(record) = self.recovery.job(job_id) else {
+            return Ok(false);
+        };
+        if record.terminal {
+            return Ok(false);
+        }
+        let workspace_path = record.workspace_path.clone().ok_or_else(|| {
+            ConnectorError::Execution("recovery record has no workspace_path".into())
+        })?;
+        let workspace = PathBuf::from(workspace_path);
+        if !workspace.exists() {
+            return Err(ConnectorError::Execution(
+                "recovery workspace no longer exists".into(),
+            ));
+        }
+        let job: Job = serde_json::from_value(record.job.clone())
+            .map_err(|e| ConnectorError::Malformed(e.to_string()))?;
+        let mut processed_actions = HashMap::new();
+        for (action_id, receipt) in record.receipts {
+            processed_actions.insert(
+                action_id,
+                CachedAction {
+                    verb: receipt.verb,
+                    args: receipt.args,
+                    frame: receipt.frame.to_string(),
+                },
+            );
+        }
+        self.jobs.lock().await.insert(
+            job_id.to_string(),
+            LocalJob {
+                job,
+                workspace_path: workspace,
+                sandbox_id: record.sandbox_id,
+                terminal: false,
+                processed_actions,
+            },
+        );
+        Ok(true)
     }
 
     pub async fn run_forever(self: Arc<Self>) {
@@ -513,7 +597,21 @@ where
                             sandbox_profile: None,
                             lease_ttl_seconds: None,
                         };
-                        self.handle_job(job).await?;
+                        let run_id =
+                            args.get("run_id").and_then(Value::as_str).ok_or_else(|| {
+                                ConnectorError::Malformed(
+                                    "create_sandbox args missing run_id".into(),
+                                )
+                            })?;
+                        let tenant_id =
+                            args.get("tenant_id")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| {
+                                    ConnectorError::Malformed(
+                                        "create_sandbox args missing tenant_id".into(),
+                                    )
+                                })?;
+                        self.handle_job(job, run_id, tenant_id).await?;
                     }
                     let frames = self.handle_action(action).await?;
                     let result = frames
@@ -564,7 +662,12 @@ where
         Ok(())
     }
 
-    async fn handle_job(&self, job: Job) -> Result<Vec<String>, ConnectorError> {
+    async fn handle_job(
+        &self,
+        job: Job,
+        run_id: &str,
+        tenant_id: &str,
+    ) -> Result<Vec<String>, ConnectorError> {
         validate_job(&job)?;
         let job_id = job.job_id.clone();
         {
@@ -573,7 +676,34 @@ where
                 return Ok(Vec::new());
             }
         }
+        if self.restore_job(&job_id).await? {
+            return Ok(Vec::new());
+        }
+        self.recovery
+            .save_job(ConnectorJobRecord {
+                job_id: job_id.clone(),
+                tenant_id: tenant_id.to_string(),
+                run_id: run_id.to_string(),
+                job: serde_json::to_value(&job)
+                    .map_err(|e| ConnectorError::Malformed(e.to_string()))?,
+                workspace_path: None,
+                sandbox_id: None,
+                terminal: false,
+                cleanup_failed: false,
+                receipts: HashMap::new(),
+                updated_at: Utc::now(),
+            })
+            .map_err(ConnectorError::Execution)?;
         let workspace = self.cloner.clone_job(&job).await?;
+        let mut record = self
+            .recovery
+            .job(&job_id)
+            .expect("recovery record was just saved");
+        record.workspace_path = Some(workspace.to_string_lossy().to_string());
+        record.updated_at = Utc::now();
+        self.recovery
+            .save_job(record)
+            .map_err(ConnectorError::Execution)?;
         let local = LocalJob {
             job,
             workspace_path: workspace,
@@ -588,6 +718,9 @@ where
 
     async fn handle_action(&self, action: Action) -> Result<Vec<String>, ConnectorError> {
         validate_action(&action)?;
+        if !self.jobs.lock().await.contains_key(&action.job_id) {
+            let _ = self.restore_job(&action.job_id).await?;
+        }
         let mut jobs = self.jobs.lock().await;
         let Some(local) = jobs.get_mut(&action.job_id) else {
             return Ok(vec![self.result_frame(
@@ -627,6 +760,13 @@ where
                     .get("sandbox_id")
                     .and_then(Value::as_str)
                     .map(str::to_string);
+                if let Some(mut record) = self.recovery.job(&action.job_id) {
+                    record.sandbox_id = local.sandbox_id.clone();
+                    record.updated_at = Utc::now();
+                    self.recovery
+                        .save_job(record)
+                        .map_err(ConnectorError::Execution)?;
+                }
                 Ok(value)
             }
             _ => self.executor.execute(&local.job, local, &action).await,
@@ -653,13 +793,30 @@ where
             ),
         };
         local.processed_actions.insert(
-            action.action_id,
+            action.action_id.clone(),
             CachedAction {
                 verb: action.verb.clone(),
                 args: action.args.clone(),
                 frame: frame.clone(),
             },
         );
+        if let Some(mut record) = self.recovery.job(&action.job_id) {
+            record.receipts.insert(
+                action.action_id.clone(),
+                ActionReceipt {
+                    verb: action.verb.clone(),
+                    args_hash: args_hash(&action.args),
+                    args: action.args.clone(),
+                    frame: serde_json::from_str(&frame)
+                        .map_err(|e| ConnectorError::Malformed(e.to_string()))?,
+                    completed_at: Utc::now(),
+                },
+            );
+            record.updated_at = Utc::now();
+            self.recovery
+                .save_job(record)
+                .map_err(ConnectorError::Execution)?;
+        }
         Ok(vec![frame])
     }
 
@@ -671,17 +828,37 @@ where
                 "invalid terminal final_status".into(),
             ));
         }
+        if !self.jobs.lock().await.contains_key(&terminal.job_id) {
+            let _ = self.restore_job(&terminal.job_id).await?;
+        }
         let local = self.jobs.lock().await.remove(&terminal.job_id);
         let Some(mut local) = local else {
             return Ok(Vec::new());
         };
         local.terminal = true;
         if terminal.instructions == "discard_local_copy" {
+            let mut cleanup_failed = false;
             if let Err(error) = self.executor.destroy(&local).await {
                 warn!(job_id = %terminal.job_id, error = %error, "sandbox cleanup failed");
+                cleanup_failed = true;
             }
             if let Err(error) = tokio::fs::remove_dir_all(&local.workspace_path).await {
                 warn!(job_id = %terminal.job_id, error = %error, "workspace cleanup failed");
+                cleanup_failed = true;
+            }
+            if cleanup_failed {
+                if let Some(mut record) = self.recovery.job(&terminal.job_id) {
+                    record.terminal = true;
+                    record.cleanup_failed = true;
+                    record.updated_at = Utc::now();
+                    self.recovery
+                        .save_job(record)
+                        .map_err(ConnectorError::Execution)?;
+                }
+            } else {
+                self.recovery
+                    .remove_job(&terminal.job_id)
+                    .map_err(ConnectorError::Execution)?;
             }
         }
         Ok(Vec::new())
@@ -709,6 +886,14 @@ where
         )
         .to_string()
     }
+}
+
+fn args_hash(args: &Value) -> String {
+    let encoded = serde_json::to_vec(args).unwrap_or_default();
+    Sha256::digest(encoded)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn envelope(kind: &str, job_id: Option<String>, payload: Value) -> Value {
@@ -1250,6 +1435,132 @@ mod tests {
     fn terminal_from_envelope(value: Value) -> Terminal {
         let envelope = parse_envelope(&value).unwrap();
         serde_json::from_value(envelope.payload).unwrap()
+    }
+
+    fn create_action(job_id: &str, action_id: &str) -> Action {
+        action_from_envelope(action(
+            job_id,
+            action_id,
+            "create_sandbox",
+            json!({
+                "run_id":"recovery-run", "tenant_id":"connector",
+                "repository":{"owner":"example","name":"service","clone_url":"https://example.com/service.git"},
+                "commit_sha":"0123456789abcdef0123456789abcdef01234567"
+            }),
+        ))
+    }
+
+    #[tokio::test]
+    async fn recovered_matching_action_replays_without_second_execution() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let durable = Arc::new(RecoveryStore::open(dir.path()).unwrap());
+        let first = FakeExecutor::default();
+        let connector = Connector::with_recovery(
+            config(),
+            first.clone(),
+            FakeCloner {
+                workspace: workspace.clone(),
+            },
+            durable,
+        );
+        let job = job();
+        let action = create_action(&job.job_id, &Uuid::new_v4().to_string());
+        connector
+            .handle_job(job.clone(), "recovery-run", "connector")
+            .await
+            .unwrap();
+        connector.handle_action(action.clone()).await.unwrap();
+        assert_eq!(first.calls.lock().await.len(), 1);
+
+        let second = FakeExecutor::default();
+        let recovered = Connector::with_recovery(
+            config(),
+            second.clone(),
+            FakeCloner { workspace },
+            Arc::new(RecoveryStore::open(dir.path()).unwrap()),
+        );
+        recovered.rehydrate().await.unwrap();
+        recovered.handle_action(action).await.unwrap();
+        assert_eq!(
+            second.calls.lock().await.len(),
+            0,
+            "recovered receipt must replay without executing"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_replay_with_different_args_is_malformed() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let durable = Arc::new(RecoveryStore::open(dir.path()).unwrap());
+        let connector = Connector::with_recovery(
+            config(),
+            FakeExecutor::default(),
+            FakeCloner {
+                workspace: workspace.clone(),
+            },
+            durable,
+        );
+        let job = job();
+        let action_id = Uuid::new_v4().to_string();
+        let first_action = create_action(&job.job_id, &action_id);
+        connector
+            .handle_job(job.clone(), "recovery-run", "connector")
+            .await
+            .unwrap();
+        connector.handle_action(first_action).await.unwrap();
+        let recovered = Connector::with_recovery(
+            config(),
+            FakeExecutor::default(),
+            FakeCloner { workspace },
+            Arc::new(RecoveryStore::open(dir.path()).unwrap()),
+        );
+        recovered.rehydrate().await.unwrap();
+        let mismatch = action_from_envelope(action(
+            &job.job_id,
+            &action_id,
+            "create_sandbox",
+            json!({"run_id":"different","tenant_id":"connector","repository":{"owner":"example","name":"service","clone_url":"https://example.com/service.git"},"commit_sha":"0123456789abcdef0123456789abcdef01234567"}),
+        ));
+        assert!(matches!(
+            recovered.handle_action(mismatch).await,
+            Err(ConnectorError::Malformed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovered_terminal_cleans_workspace_without_memory_state() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let durable = Arc::new(RecoveryStore::open(dir.path()).unwrap());
+        let connector = Connector::with_recovery(
+            config(),
+            FakeExecutor::default(),
+            FakeCloner {
+                workspace: workspace.clone(),
+            },
+            durable,
+        );
+        let job = job();
+        let create = create_action(&job.job_id, &Uuid::new_v4().to_string());
+        connector
+            .handle_job(job.clone(), "recovery-run", "connector")
+            .await
+            .unwrap();
+        connector.handle_action(create).await.unwrap();
+        let second = FakeExecutor::default();
+        let recovered = Connector::with_recovery(
+            config(),
+            second.clone(),
+            FakeCloner {
+                workspace: workspace.clone(),
+            },
+            Arc::new(RecoveryStore::open(dir.path()).unwrap()),
+        );
+        recovered.handle_terminal(terminal_from_envelope(envelope("terminal", Some(job.job_id.clone()), json!({"job_id":job.job_id,"final_status":"fix_finalized","instructions":"discard_local_copy"})))).await.unwrap();
+        assert_eq!(*second.destroyed.lock().await, 1);
+        assert!(!workspace.exists());
     }
 
     #[test]
