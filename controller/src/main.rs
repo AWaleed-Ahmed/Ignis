@@ -8,6 +8,7 @@ use raphael_sandbox_controller::cleanup::ttl::TtlReaper;
 use raphael_sandbox_controller::connector::{Connector, ConnectorConfig};
 use raphael_sandbox_controller::domain::service::SandboxService;
 use raphael_sandbox_controller::k8s::{create_backend, ClusterBackend};
+use raphael_sandbox_controller::state::recovery::RecoveryStore;
 use raphael_sandbox_controller::state::registry::SandboxRegistry;
 use raphael_sandbox_controller::state::sqlite::SqliteStore;
 use tracing_subscriber::EnvFilter;
@@ -45,8 +46,9 @@ async fn main() -> anyhow::Result<()> {
 
     let backend: Arc<dyn ClusterBackend> = create_backend(&backend_name)?;
 
+    let data_dir = env::var("RAPHAEL_DATA_DIR").unwrap_or_else(|_| ".raphael-data".into());
     let sqlite_path = env::var("RAPHAEL_SQLITE_PATH").unwrap_or_else(|_| {
-        let dir = env::var("RAPHAEL_DATA_DIR").unwrap_or_else(|_| ".raphael-data".into());
+        let dir = data_dir.clone();
         format!("{dir}/sandboxes.db")
     });
     let registry = match SqliteStore::open(&sqlite_path) {
@@ -62,12 +64,22 @@ async fn main() -> anyhow::Result<()> {
 
     let _ = raphael_sandbox_controller::artifacts::ensure_root();
 
-    let service = Arc::new(SandboxService::new(backend.clone(), registry.clone()));
+    let recovery = Arc::new(RecoveryStore::open(&data_dir).map_err(|e| anyhow::anyhow!(e))?);
+    let service = Arc::new(SandboxService::with_recovery(
+        backend.clone(),
+        registry.clone(),
+        recovery.clone(),
+    ));
 
     if let Some(config) = ConnectorConfig::from_env()? {
         tracing::info!(dispatch_url = %config.dispatch_url, controller_url = %config.controller_url, "starting outbound connector");
-        let connector = Arc::new(Connector::from_config(config));
-        tokio::spawn(connector.run_forever());
+        let connector = Arc::new(Connector::from_config(config, recovery));
+        tokio::spawn(async move {
+            if let Err(error) = connector.rehydrate().await {
+                tracing::warn!(error = %error, "connector recovery rehydration failed");
+            }
+            connector.run_forever().await;
+        });
     }
 
     let reaper = TtlReaper::new(service.clone(), Duration::from_secs(30));

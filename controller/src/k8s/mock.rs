@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -25,13 +26,19 @@ struct MockNs {
 
 pub struct MockCluster {
     namespaces: RwLock<HashMap<String, MockNs>>,
+    create_calls: AtomicUsize,
 }
 
 impl MockCluster {
     pub fn new() -> Self {
         Self {
             namespaces: RwLock::new(HashMap::new()),
+            create_calls: AtomicUsize::new(0),
         }
+    }
+
+    pub fn create_call_count(&self) -> usize {
+        self.create_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -48,6 +55,7 @@ impl ClusterBackend for MockCluster {
     }
 
     async fn create_isolated_namespace(&self, spec: &NamespaceSpec) -> Result<(), DomainError> {
+        self.create_calls.fetch_add(1, Ordering::SeqCst);
         let mut guard = self
             .namespaces
             .write()

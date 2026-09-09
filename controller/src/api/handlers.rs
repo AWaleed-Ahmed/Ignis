@@ -1,14 +1,57 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use serde::{de::DeserializeOwned, Serialize};
 use serde_json::json;
+use std::future::Future;
 
 use crate::domain::errors::DomainError;
+use crate::domain::ids::sandbox_id_from_run;
 use crate::domain::models::*;
 use crate::domain::service::SandboxService;
+use crate::state::recovery::value_hash;
+
+async fn guarded<T, F>(
+    service: &SandboxService,
+    headers: &HeaderMap,
+    scope: String,
+    request: serde_json::Value,
+    execute: F,
+) -> Result<T, ApiError>
+where
+    T: Serialize + DeserializeOwned,
+    F: Future<Output = Result<T, DomainError>>,
+{
+    let Some(action_id) = headers
+        .get("x-raphael-connector-action-id")
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Ok(execute.await?);
+    };
+    let hash = value_hash(&request);
+    if let Some(response) = service
+        .recovery()
+        .controller_receipt(&scope, action_id, &hash)
+        .map_err(DomainError::InvalidRequest)?
+    {
+        return serde_json::from_value(response)
+            .map_err(|e| ApiError(DomainError::Internal(e.to_string())));
+    }
+    let response = execute.await?;
+    service
+        .recovery()
+        .save_controller_receipt(
+            &scope,
+            action_id,
+            hash,
+            serde_json::to_value(&response).map_err(|e| DomainError::Internal(e.to_string()))?,
+        )
+        .map_err(DomainError::Internal)?;
+    Ok(response)
+}
 
 pub async fn health() -> impl IntoResponse {
     Json(json!({
@@ -19,41 +62,95 @@ pub async fn health() -> impl IntoResponse {
 
 pub async fn create_sandbox(
     State(service): State<Arc<SandboxService>>,
+    headers: HeaderMap,
     Json(req): Json<CreateSandboxRequest>,
 ) -> Result<Json<CreateSandboxResponse>, ApiError> {
-    Ok(Json(service.create_sandbox(req).await?))
+    let scope = sandbox_id_from_run(&req.run_id);
+    let body =
+        serde_json::to_value(&req).map_err(|e| ApiError(DomainError::Internal(e.to_string())))?;
+    Ok(Json(
+        guarded(&service, &headers, scope, body, service.create_sandbox(req)).await?,
+    ))
 }
 
 pub async fn deploy_revision(
     State(service): State<Arc<SandboxService>>,
     Path(sandbox_id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<DeployRevisionRequest>,
 ) -> Result<Json<DeployRevisionResponse>, ApiError> {
-    Ok(Json(service.deploy_revision(&sandbox_id, req).await?))
+    let body =
+        serde_json::to_value(&req).map_err(|e| ApiError(DomainError::Internal(e.to_string())))?;
+    Ok(Json(
+        guarded(
+            &service,
+            &headers,
+            sandbox_id.clone(),
+            body,
+            service.deploy_revision(&sandbox_id, req),
+        )
+        .await?,
+    ))
 }
 
 pub async fn observe_failure(
     State(service): State<Arc<SandboxService>>,
     Path(sandbox_id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<ObserveFailureRequest>,
 ) -> Result<Json<ObserveFailureResponse>, ApiError> {
-    Ok(Json(service.observe_failure(&sandbox_id, req).await?))
+    let body =
+        serde_json::to_value(&req).map_err(|e| ApiError(DomainError::Internal(e.to_string())))?;
+    Ok(Json(
+        guarded(
+            &service,
+            &headers,
+            sandbox_id.clone(),
+            body,
+            service.observe_failure(&sandbox_id, req),
+        )
+        .await?,
+    ))
 }
 
 pub async fn run_validation(
     State(service): State<Arc<SandboxService>>,
     Path(sandbox_id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<RunValidationRequest>,
 ) -> Result<Json<ValidationResults>, ApiError> {
-    Ok(Json(service.run_validation(&sandbox_id, req).await?))
+    let body =
+        serde_json::to_value(&req).map_err(|e| ApiError(DomainError::Internal(e.to_string())))?;
+    Ok(Json(
+        guarded(
+            &service,
+            &headers,
+            sandbox_id.clone(),
+            body,
+            service.run_validation(&sandbox_id, req),
+        )
+        .await?,
+    ))
 }
 
 pub async fn finalize_result(
     State(service): State<Arc<SandboxService>>,
     Path(sandbox_id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<FinalizeResultRequest>,
 ) -> Result<Json<FinalizeResultResponse>, ApiError> {
-    Ok(Json(service.finalize_result(&sandbox_id, req).await?))
+    let body =
+        serde_json::to_value(&req).map_err(|e| ApiError(DomainError::Internal(e.to_string())))?;
+    Ok(Json(
+        guarded(
+            &service,
+            &headers,
+            sandbox_id.clone(),
+            body,
+            service.finalize_result(&sandbox_id, req),
+        )
+        .await?,
+    ))
 }
 
 pub async fn get_result(
