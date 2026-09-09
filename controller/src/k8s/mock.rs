@@ -1,9 +1,12 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
 use crate::domain::errors::DomainError;
@@ -14,6 +17,7 @@ use crate::k8s::{
 };
 use crate::observe::signatures::analyze_rendered_yaml;
 
+#[derive(Clone, Serialize, Deserialize)]
 struct MockNs {
     exists: bool,
     rendered_yaml: Option<String>,
@@ -26,15 +30,71 @@ struct MockNs {
 
 pub struct MockCluster {
     namespaces: RwLock<HashMap<String, MockNs>>,
+    store_root: Option<PathBuf>,
     create_calls: AtomicUsize,
 }
 
 impl MockCluster {
     pub fn new() -> Self {
+        if let Some(data_dir) = std::env::var_os("RAPHAEL_DATA_DIR") {
+            return Self::with_store(data_dir).unwrap_or_else(|error| {
+                tracing::warn!(%error, "mock namespace persistence unavailable; continuing in-memory only");
+                Self::in_memory()
+            });
+        }
+        Self::in_memory()
+    }
+
+    fn in_memory() -> Self {
         Self {
             namespaces: RwLock::new(HashMap::new()),
+            store_root: None,
             create_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// Reload mock namespace state from the same RAPHAEL_DATA_DIR used by the
+    /// sandbox registry and connector recovery store. This is mock-only
+    /// controller state; no public API exposes these records.
+    pub fn with_store(data_dir: impl AsRef<Path>) -> Result<Self, String> {
+        let store_root = data_dir.as_ref().join("mock-namespaces");
+        fs::create_dir_all(&store_root).map_err(|error| error.to_string())?;
+        let mut namespaces = HashMap::new();
+        for entry in fs::read_dir(&store_root).map_err(|error| error.to_string())? {
+            let path = entry.map_err(|error| error.to_string())?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let namespace = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| format!("invalid mock namespace filename: {}", path.display()))?
+                .to_owned();
+            let state =
+                serde_json::from_slice(&fs::read(&path).map_err(|error| error.to_string())?)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+            namespaces.insert(namespace, state);
+        }
+        Ok(Self {
+            namespaces: RwLock::new(namespaces),
+            store_root: Some(store_root),
+            create_calls: AtomicUsize::new(0),
+        })
+    }
+
+    fn persist_namespace(&self, namespace: &str, state: &MockNs) -> Result<(), DomainError> {
+        let Some(root) = &self.store_root else {
+            return Ok(());
+        };
+        let path = root.join(format!("{namespace}.json"));
+        let temporary = path.with_extension("json.tmp");
+        fs::write(
+            &temporary,
+            serde_json::to_vec_pretty(state)
+                .map_err(|error| DomainError::Internal(error.to_string()))?,
+        )
+        .map_err(|error| DomainError::Internal(error.to_string()))?;
+        fs::rename(temporary, path).map_err(|error| DomainError::Internal(error.to_string()))
     }
 
     pub fn create_call_count(&self) -> usize {
@@ -68,18 +128,17 @@ impl ClusterBackend for MockCluster {
                 )));
             }
         }
-        guard.insert(
-            spec.namespace.clone(),
-            MockNs {
-                exists: true,
-                rendered_yaml: None,
-                secret_fixtures_applied: false,
-                healthy_override: false,
-                sandbox_id: spec.sandbox_id.clone(),
-                run_id: spec.run_id.clone(),
-                expires_at: spec.expires_at,
-            },
-        );
+        let state = MockNs {
+            exists: true,
+            rendered_yaml: None,
+            secret_fixtures_applied: false,
+            healthy_override: false,
+            sandbox_id: spec.sandbox_id.clone(),
+            run_id: spec.run_id.clone(),
+            expires_at: spec.expires_at,
+        };
+        self.persist_namespace(&spec.namespace, &state)?;
+        guard.insert(spec.namespace.clone(), state);
         tracing::info!(
             namespace = %spec.namespace,
             sandbox_id = %spec.sandbox_id,
@@ -97,6 +156,7 @@ impl ClusterBackend for MockCluster {
             Some(ns) if ns.exists => {
                 ns.exists = false;
                 ns.rendered_yaml = None;
+                self.persist_namespace(namespace, ns)?;
                 Ok(DestroyOutcome::Destroyed)
             }
             Some(_) | None => Ok(DestroyOutcome::AlreadyDestroyed),
@@ -134,6 +194,7 @@ impl ClusterBackend for MockCluster {
             }
         }
         ns.rendered_yaml = Some(rendered_yaml.to_string());
+        self.persist_namespace(namespace, ns)?;
         Ok(ApplyResult {
             resources,
             image_refs,
@@ -258,6 +319,7 @@ impl ClusterBackend for MockCluster {
         // Validate YAML parses, but do NOT treat fixtures as the deployed workload.
         let _ = parse_resources(secrets_yaml)?;
         ns.secret_fixtures_applied = true;
+        self.persist_namespace(namespace, ns)?;
         tracing::info!(%namespace, "mock: applied synthetic secret fixtures");
         Ok(())
     }
@@ -538,4 +600,66 @@ fn collect_images(value: &Value, out: &mut Vec<String>) {
     }
 }
 
-use serde::Deserialize;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration as ChronoDuration, Utc};
+
+    fn spec() -> NamespaceSpec {
+        NamespaceSpec {
+            namespace: "raphael-run-restart-test".into(),
+            sandbox_id: "sb-restart-test".into(),
+            run_id: "restart-test".into(),
+            tenant_id: "tenant-test".into(),
+            expires_at: Utc::now() + ChronoDuration::minutes(20),
+            service_account: "raphael-sandbox-sa".into(),
+            cpu_limit: "500m".into(),
+            memory_limit: "512Mi".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn persists_namespace_and_rendered_state_across_restart() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let cluster = MockCluster::with_store(data_dir.path()).unwrap();
+        let namespace = spec().namespace;
+        cluster.create_isolated_namespace(&spec()).await.unwrap();
+        let rendered_yaml = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+spec:
+  template:
+    spec:
+      containers:
+        - name: app
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9090
+"#;
+        cluster
+            .apply_manifests(&namespace, rendered_yaml, Duration::from_secs(1))
+            .await
+            .unwrap();
+        drop(cluster);
+
+        let restarted = MockCluster::with_store(data_dir.path()).unwrap();
+        let namespaces = restarted.list_managed_namespaces().await.unwrap();
+        assert_eq!(namespaces.len(), 1);
+        assert_eq!(namespaces[0].name, namespace);
+        assert_eq!(namespaces[0].sandbox_id.as_deref(), Some("sb-restart-test"));
+
+        let observation = restarted
+            .observe_workload(&namespace, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(observation.rendered_hint.as_deref(), Some(rendered_yaml));
+        assert!(observation.events.iter().any(|event| {
+            event.reason == "Unhealthy" && event.message.contains("readiness probe")
+        }));
+    }
+}
