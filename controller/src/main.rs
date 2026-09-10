@@ -44,9 +44,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let backend: Arc<dyn ClusterBackend> = create_backend(&backend_name)?;
-
     let data_dir = env::var("RAPHAEL_DATA_DIR").unwrap_or_else(|_| ".raphael-data".into());
+    let backend: Arc<dyn ClusterBackend> =
+        create_backend(&backend_name, std::path::Path::new(&data_dir))?;
     let sqlite_path = env::var("RAPHAEL_SQLITE_PATH").unwrap_or_else(|_| {
         let dir = data_dir.clone();
         format!("{dir}/sandboxes.db")
