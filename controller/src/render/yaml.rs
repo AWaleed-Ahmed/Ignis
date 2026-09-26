@@ -69,5 +69,48 @@ pub fn render_yaml(workspace: &str, manifests: &ManifestSpec) -> Result<RenderRe
 
 fn read_file(path: &Path) -> Result<String, DomainError> {
     fs::read_to_string(path)
+        // Host Git settings may expand LF blobs to CRLF on checkout. Keep
+        // rendered files and the combined YAML encoding-stable on the wire.
+        // Do not rewrite the workspace or remove standalone carriage returns.
+        .map(|content| content.replace("\r\n", "\n"))
         .map_err(|e| DomainError::RenderFailed(format!("{}: {e}", path.display())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rendered_yaml_and_files_normalize_crlf_without_rewriting_source() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("app.yaml");
+        let lf =
+            "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: app\ndata:\n  greeting: hello\n";
+        let spec: ManifestSpec = serde_json::from_value(serde_json::json!({
+            "type": "yaml", "path": "app.yaml"
+        }))
+        .unwrap();
+
+        for content in [
+            lf.to_string(),
+            lf.replace('\n', "\r\n"),
+            lf.replacen('\n', "\r\n", 2),
+        ] {
+            fs::write(&source, content.as_bytes()).unwrap();
+            let rendered = render_yaml(workspace.path().to_str().unwrap(), &spec).unwrap();
+            assert_eq!(rendered.yaml, lf);
+            assert_eq!(rendered.files.len(), 1);
+            assert_eq!(rendered.files[0].path, "app.yaml");
+            assert_eq!(rendered.files[0].content, lf);
+            assert_eq!(fs::read(&source).unwrap(), content.as_bytes());
+        }
+    }
+
+    #[test]
+    fn normalization_preserves_unicode_and_missing_final_newline() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("app.yaml");
+        fs::write(&source, "# café\r\nkind: ConfigMap").unwrap();
+        assert_eq!(read_file(&source).unwrap(), "# café\nkind: ConfigMap");
+    }
 }
