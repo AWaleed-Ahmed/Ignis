@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pytest
 from pathlib import Path
 
 from jsonschema import Draft202012Validator
@@ -10,6 +11,18 @@ CONTRACTS = Path(__file__).resolve().parents[2] / "contracts" / "sandbox"
 
 def _load(name: str) -> dict:
     return json.loads((CONTRACTS / name).read_text())
+
+
+@pytest.mark.parametrize("backend", ["kind", "kubeconfig", "mock", "kubectl"])
+def test_create_response_accepts_supported_backends(backend):
+    instance = {
+        "sandbox_id": "sb-test", "namespace": "sandbox-test", "status": "ready",
+        "created_at": "2026-09-27T00:00:00Z", "expires_at": "2026-09-27T01:00:00Z",
+        "cluster_backend": backend,
+    }
+    validator = Draft202012Validator(_load("create_sandbox.response.json"))
+    validator.validate(instance)
+    assert not validator.is_valid({**instance, "cluster_backend": "unsupported-backend"})
 
 
 def test_create_request_schema_accepts_minimal():
