@@ -11,7 +11,7 @@
     "namespace": { "type": "string" },
     "cluster_backend": {
       "type": "string",
-      "enum": ["kind", "kubeconfig", "mock"]
+      "enum": ["kind", "kubeconfig", "mock", "kubectl"]
     },
     "status": {
       "type": "string",
