@@ -1,6 +1,9 @@
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+use tokio::time::{sleep, timeout, Instant};
 
 use chrono::{Duration as ChronoDuration, Utc};
 use uuid::Uuid;
@@ -190,11 +193,25 @@ impl SandboxService {
             .await?;
 
         let mut image_refs = apply.image_refs.clone();
-        if let Ok(digests) = self.backend.resolve_image_digests(&record.namespace).await {
-            for d in digests {
-                if !image_refs.iter().any(|x| x == &d) {
-                    image_refs.push(d);
-                }
+        // The real API server may accept a Deployment before any Pod has an imageID.
+        // Bound the entire best-effort lookup by the request's existing wait_seconds.
+        // Mock has no runtime digests: preserve its immediate tags-only behavior.
+        let digests = if self.backend.name() == "mock" {
+            self.backend
+                .resolve_image_digests(&record.namespace)
+                .await
+                .unwrap_or_default()
+        } else {
+            poll_image_digests(
+                Duration::from_secs(req.wait_seconds as u64),
+                Duration::from_millis(500),
+                || self.backend.resolve_image_digests(&record.namespace),
+            )
+            .await
+        };
+        for digest in digests {
+            if !image_refs.iter().any(|reference| reference == &digest) {
+                image_refs.push(digest);
             }
         }
 
@@ -786,6 +803,85 @@ fn copy_dir_recursive(from: PathBuf, to: PathBuf) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+async fn poll_image_digests<F, Fut>(
+    budget: Duration,
+    interval: Duration,
+    mut fetch: F,
+) -> Vec<String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<String>, DomainError>>,
+{
+    let deadline = Instant::now() + budget;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return vec![];
+        }
+        if let Ok(Ok(digests)) = timeout(remaining, fetch()).await {
+            if !digests.is_empty() {
+                return digests;
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return vec![];
+        }
+        sleep(interval.min(remaining)).await;
+    }
+}
+
+#[cfg(test)]
+mod digest_poll_tests {
+    use super::poll_image_digests;
+    use crate::domain::errors::DomainError;
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn waits_for_late_status_then_returns_digest() {
+        let calls = Cell::new(0);
+        let result =
+            poll_image_digests(Duration::from_millis(200), Duration::from_millis(1), || {
+                let call = calls.get() + 1;
+                calls.set(call);
+                async move {
+                    if call < 3 {
+                        Ok(vec![])
+                    } else {
+                        Ok(vec!["busybox@sha256:abc".into()])
+                    }
+                }
+            })
+            .await;
+        assert_eq!(calls.get(), 3);
+        assert_eq!(result, vec!["busybox@sha256:abc"]);
+    }
+
+    #[tokio::test]
+    async fn times_out_to_tags_when_image_id_never_appears() {
+        let calls = Cell::new(0);
+        let result =
+            poll_image_digests(Duration::from_millis(20), Duration::from_millis(1), || {
+                calls.set(calls.get() + 1);
+                async { Ok::<_, DomainError>(vec![]) }
+            })
+            .await;
+        assert!(calls.get() > 1);
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stalled_lookup_cannot_exceed_the_existing_budget() {
+        let result =
+            poll_image_digests(Duration::from_millis(20), Duration::from_millis(1), || {
+                std::future::pending::<Result<Vec<String>, DomainError>>()
+            })
+            .await;
+        assert!(result.is_empty());
+    }
 }
 
 fn build_fidelity(
