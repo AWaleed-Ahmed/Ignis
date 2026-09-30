@@ -92,7 +92,8 @@ pub struct LogArtifact {
 pub fn create_backend(name: &str) -> anyhow::Result<Arc<dyn ClusterBackend>> {
     match name {
         "mock" => Ok(Arc::new(mock::MockCluster::new())),
-        "kind" | "kubeconfig" | "kubectl" => Ok(Arc::new(kubectl::KubectlCluster::from_env()?)),
+        "kind" | "kubectl" => Ok(Arc::new(kubectl::KubectlCluster::with_name("kind")?)),
+        "kubeconfig" => Ok(Arc::new(kubectl::KubectlCluster::with_name("kubeconfig")?)),
         other => anyhow::bail!("unknown RAPHAEL_CLUSTER_BACKEND: {other}"),
     }
 }

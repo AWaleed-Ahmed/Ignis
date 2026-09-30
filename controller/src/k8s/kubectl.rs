@@ -15,13 +15,19 @@ use crate::k8s::{
 };
 
 pub struct KubectlCluster {
+    name: &'static str,
     kubeconfig: Option<PathBuf>,
     context: Option<String>,
 }
 
 impl KubectlCluster {
     pub fn from_env() -> anyhow::Result<Self> {
+        Self::with_name("kind")
+    }
+
+    pub fn with_name(name: &'static str) -> anyhow::Result<Self> {
         Ok(Self {
+            name,
             kubeconfig: std::env::var_os("KUBECONFIG").map(PathBuf::from),
             context: std::env::var("RAPHAEL_KUBE_CONTEXT").ok(),
         })
@@ -61,7 +67,7 @@ impl KubectlCluster {
 #[async_trait]
 impl ClusterBackend for KubectlCluster {
     fn name(&self) -> &'static str {
-        "kubectl"
+        self.name
     }
 
     async fn create_isolated_namespace(&self, spec: &NamespaceSpec) -> Result<(), DomainError> {
