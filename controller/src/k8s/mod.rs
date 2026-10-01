@@ -2,6 +2,7 @@ pub mod kubectl;
 pub mod mock;
 pub mod types;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +12,10 @@ use crate::domain::errors::DomainError;
 use crate::domain::models::ResourceRef;
 
 pub use types::*;
+
+/// Internal mapping from the requested container image to its runtime digest.
+/// Keeping the original image prevents one tag from satisfying another tag.
+pub type ImageDigests = BTreeMap<String, String>;
 
 #[derive(Debug, Clone)]
 pub struct ManagedNamespace {
@@ -71,9 +76,9 @@ pub trait ClusterBackend: Send + Sync {
     ) -> Result<Vec<LogArtifact>, DomainError>;
 
     /// Best-effort resolve running container image digests (imageID) in the namespace.
-    async fn resolve_image_digests(&self, namespace: &str) -> Result<Vec<String>, DomainError> {
+    async fn resolve_image_digests(&self, namespace: &str) -> Result<ImageDigests, DomainError> {
         let _ = namespace;
-        Ok(vec![])
+        Ok(ImageDigests::new())
     }
 
     /// List namespaces labeled raphael.managed=true (for leak reconciliation).

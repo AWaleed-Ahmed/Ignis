@@ -359,9 +359,12 @@ impl ClusterBackend for MockCluster {
         Ok(out)
     }
 
-    async fn resolve_image_digests(&self, _namespace: &str) -> Result<Vec<String>, DomainError> {
+    async fn resolve_image_digests(
+        &self,
+        _namespace: &str,
+    ) -> Result<crate::k8s::ImageDigests, DomainError> {
         // Mock has no runtime digests; tags-only gap is disclosed by fidelity.
-        Ok(vec![])
+        Ok(crate::k8s::ImageDigests::new())
     }
 
     async fn list_managed_namespaces(

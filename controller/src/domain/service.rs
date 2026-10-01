@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::domain::errors::DomainError;
 use crate::domain::ids::{namespace_for_run, sandbox_id_from_run};
 use crate::domain::models::*;
-use crate::k8s::{ClusterBackend, DestroyOutcome, NamespaceSpec};
+use crate::k8s::{ClusterBackend, DestroyOutcome, ImageDigests, NamespaceSpec};
 use crate::observe;
 use crate::policy;
 use crate::render;
@@ -203,20 +203,27 @@ impl SandboxService {
                 .unwrap_or_default()
         } else {
             poll_image_digests(
+                &apply.image_refs,
                 Duration::from_secs(req.wait_seconds as u64),
                 Duration::from_millis(500),
                 || self.backend.resolve_image_digests(&record.namespace),
             )
             .await
         };
-        for digest in digests {
-            if !image_refs.iter().any(|reference| reference == &digest) {
-                image_refs.push(digest);
+        for (image, digest) in &digests {
+            if apply.image_refs.contains(image) && !image_refs.contains(digest) {
+                image_refs.push(digest.clone());
             }
         }
 
         let tool_versions = crate::tools::collect_tool_versions();
-        let fidelity = build_fidelity(&record, &req, &rendered.render_path, &image_refs);
+        let fidelity = build_fidelity(
+            &record,
+            &req,
+            &rendered.render_path,
+            &apply.image_refs,
+            &digests,
+        );
         let now = Utc::now();
         let tools_blob = serde_json::to_string_pretty(&tool_versions).unwrap_or_default();
         let manifest_art = store_artifact(sandbox_id, "manifest", &rendered.yaml);
@@ -806,81 +813,253 @@ fn copy_dir_recursive(from: PathBuf, to: PathBuf) -> std::io::Result<()> {
 }
 
 async fn poll_image_digests<F, Fut>(
+    expected_images: &[String],
     budget: Duration,
     interval: Duration,
     mut fetch: F,
-) -> Vec<String>
+) -> ImageDigests
 where
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<Vec<String>, DomainError>>,
+    Fut: Future<Output = Result<ImageDigests, DomainError>>,
 {
     let deadline = Instant::now() + budget;
+    let mut observed = ImageDigests::new();
+    if expected_images.is_empty() {
+        return observed;
+    }
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return vec![];
+            return observed;
         }
         if let Ok(Ok(digests)) = timeout(remaining, fetch()).await {
-            if !digests.is_empty() {
-                return digests;
+            // Use the latest successful snapshot, not a union of historical
+            // snapshots that could hide an image no longer resolved now.
+            observed = digests;
+            if unresolved_images(expected_images, &observed).is_empty() {
+                return observed;
             }
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return vec![];
+            return observed;
         }
         sleep(interval.min(remaining)).await;
     }
 }
 
+fn unresolved_images<'a>(expected: &'a [String], digests: &ImageDigests) -> Vec<&'a str> {
+    expected
+        .iter()
+        .filter(|image| {
+            !digests
+                .get(*image)
+                .is_some_and(|digest| digest.contains("@sha256:"))
+        })
+        .map(String::as_str)
+        .collect()
+}
+
+fn image_digest_gaps(expected: &[String], digests: &ImageDigests) -> Vec<String> {
+    unresolved_images(expected, digests)
+        .into_iter()
+        .map(|image| format!("image digests not resolved; tags only: {image}"))
+        .collect()
+}
+
 #[cfg(test)]
 mod digest_poll_tests {
-    use super::poll_image_digests;
+    use super::{build_fidelity, poll_image_digests};
     use crate::domain::errors::DomainError;
+    use crate::domain::models::DeployRevisionRequest;
+    use crate::k8s::ImageDigests;
+    use crate::state::registry::SandboxRecord;
     use std::cell::Cell;
     use std::time::Duration;
+
+    fn expected() -> Vec<String> {
+        vec!["busybox:1.37.0".into(), "busybox:1.36.1".into()]
+    }
+
+    fn resolved(both: bool) -> ImageDigests {
+        let mut map = ImageDigests::from([("busybox:1.37.0".into(), "busybox@sha256:aaa".into())]);
+        if both {
+            map.insert("busybox:1.36.1".into(), "busybox@sha256:bbb".into());
+        }
+        map
+    }
+
+    fn fidelity_gaps(images: &[String], digests: &ImageDigests) -> Vec<String> {
+        let record: SandboxRecord = serde_json::from_value(serde_json::json!({
+            "sandbox_id": "sb-test", "run_id": "test", "tenant_id": "test",
+            "namespace": "test", "commit_sha": "abc", "repository_owner": "test",
+            "repository_name": "test", "status": "ready",
+            "created_at": "2026-10-01T00:00:00Z", "expires_at": "2026-10-01T01:00:00Z",
+            "service_account": "test", "resources": [], "image_refs": [],
+            "artifacts": [], "cluster_backend": "kubectl"
+        }))
+        .unwrap();
+        let req: DeployRevisionRequest = serde_json::from_value(serde_json::json!({
+            "repository_sha": "abc", "manifests": {"type": "yaml", "path": "app.yaml"}
+        }))
+        .unwrap();
+        build_fidelity(&record, &req, "yaml", images, digests).material_gaps
+    }
 
     #[tokio::test]
     async fn waits_for_late_status_then_returns_digest() {
         let calls = Cell::new(0);
-        let result =
-            poll_image_digests(Duration::from_millis(200), Duration::from_millis(1), || {
+        let result = poll_image_digests(
+            &expected()[..1],
+            Duration::from_millis(200),
+            Duration::from_millis(1),
+            || {
                 let call = calls.get() + 1;
                 calls.set(call);
                 async move {
                     if call < 3 {
-                        Ok(vec![])
+                        Ok(ImageDigests::new())
                     } else {
-                        Ok(vec!["busybox@sha256:abc".into()])
+                        Ok(resolved(false))
                     }
                 }
-            })
-            .await;
+            },
+        )
+        .await;
         assert_eq!(calls.get(), 3);
-        assert_eq!(result, vec!["busybox@sha256:abc"]);
+        assert_eq!(result, resolved(false));
     }
 
     #[tokio::test]
     async fn times_out_to_tags_when_image_id_never_appears() {
         let calls = Cell::new(0);
-        let result =
-            poll_image_digests(Duration::from_millis(20), Duration::from_millis(1), || {
+        let result = poll_image_digests(
+            &expected(),
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            || {
                 calls.set(calls.get() + 1);
-                async { Ok::<_, DomainError>(vec![]) }
-            })
-            .await;
+                async { Ok::<_, DomainError>(ImageDigests::new()) }
+            },
+        )
+        .await;
         assert!(calls.get() > 1);
         assert!(result.is_empty());
     }
 
     #[tokio::test]
     async fn a_stalled_lookup_cannot_exceed_the_existing_budget() {
-        let result =
-            poll_image_digests(Duration::from_millis(20), Duration::from_millis(1), || {
-                std::future::pending::<Result<Vec<String>, DomainError>>()
-            })
-            .await;
+        let result = poll_image_digests(
+            &expected(),
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            || std::future::pending::<Result<ImageDigests, DomainError>>(),
+        )
+        .await;
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn waits_for_second_image_even_when_first_has_a_digest() {
+        let calls = Cell::new(0);
+        let result = poll_image_digests(
+            &expected(),
+            Duration::from_millis(200),
+            Duration::from_millis(1),
+            || {
+                let call = calls.get() + 1;
+                calls.set(call);
+                async move { Ok(resolved(call >= 3)) }
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 3);
+        assert_eq!(result, resolved(true));
+        assert!(fidelity_gaps(&expected(), &result).is_empty());
+    }
+
+    #[tokio::test]
+    async fn timeout_preserves_partial_digests_and_names_only_unresolved_image() {
+        let result = poll_image_digests(
+            &expected(),
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            || async { Ok(resolved(false)) },
+        )
+        .await;
+        assert_eq!(result, resolved(false));
+        assert_eq!(
+            fidelity_gaps(&expected(), &result),
+            vec!["image digests not resolved; tags only: busybox:1.36.1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn all_images_resolved_exits_immediately_without_gap() {
+        let calls = Cell::new(0);
+        let result = poll_image_digests(
+            &expected(),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+            || {
+                calls.set(calls.get() + 1);
+                async { Ok(resolved(true)) }
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 1);
+        assert!(fidelity_gaps(&expected(), &result).is_empty());
+    }
+
+    #[tokio::test]
+    async fn kubectl_error_mid_poll_recovers_without_failing_deploy() {
+        let calls = Cell::new(0);
+        let result = poll_image_digests(
+            &expected(),
+            Duration::from_millis(200),
+            Duration::from_millis(1),
+            || {
+                let call = calls.get() + 1;
+                calls.set(call);
+                async move {
+                    match call {
+                        1 => Ok(resolved(false)),
+                        2 => Err(DomainError::ClusterUnavailable(
+                            "temporary kubectl failure".into(),
+                        )),
+                        _ => Ok(resolved(true)),
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 3);
+        assert_eq!(result, resolved(true));
+        assert!(fidelity_gaps(&expected(), &result).is_empty());
+    }
+
+    #[tokio::test]
+    async fn zero_wait_skips_lookup_and_discloses_each_unresolved_image() {
+        let calls = Cell::new(0);
+        let result = poll_image_digests(
+            &expected(),
+            Duration::ZERO,
+            Duration::from_millis(1),
+            || {
+                calls.set(calls.get() + 1);
+                async { Ok(resolved(true)) }
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 0);
+        assert!(result.is_empty());
+        assert_eq!(
+            fidelity_gaps(&expected(), &result),
+            vec![
+                "image digests not resolved; tags only: busybox:1.37.0",
+                "image digests not resolved; tags only: busybox:1.36.1"
+            ]
+        );
     }
 }
 
@@ -888,7 +1067,8 @@ fn build_fidelity(
     record: &SandboxRecord,
     req: &DeployRevisionRequest,
     render_path: &str,
-    image_refs: &[String],
+    expected_images: &[String],
+    digests: &ImageDigests,
 ) -> FidelityReport {
     let same_commit = record.commit_sha.starts_with(&req.repository_sha)
         || req.repository_sha.starts_with(&record.commit_sha);
@@ -904,14 +1084,23 @@ fn build_fidelity(
     if self_is_mock(record) {
         gaps.push("mock cluster backend; not identical to customer API server".into());
     }
-    let has_digest = image_refs.iter().any(|i| i.contains("@sha256:"));
-    if !image_refs.is_empty() && !has_digest {
-        gaps.push("image digests not resolved; tags only".into());
-    }
+    let all_resolved = if self_is_mock(record) {
+        // Preserve the mock backend's existing global tags-only disclosure.
+        let has_digest = expected_images.iter().any(|i| i.contains("@sha256:"));
+        if !expected_images.is_empty() && !has_digest {
+            gaps.push("image digests not resolved; tags only".into());
+        }
+        has_digest || expected_images.is_empty()
+    } else {
+        let image_gaps = image_digest_gaps(expected_images, digests);
+        let complete = image_gaps.is_empty();
+        gaps.extend(image_gaps);
+        complete
+    };
     let checklist = FidelityChecklist {
         same_commit,
         same_render_path: !render_path.is_empty(),
-        same_image_digest_or_tag: !image_refs.is_empty(),
+        same_image_digest_or_tag: !expected_images.is_empty(),
         equivalent_k8s_semantics: !self_is_mock(record),
         equivalent_non_secret_config: true,
         dependencies_available: true,
@@ -923,7 +1112,7 @@ fn build_fidelity(
             checklist.same_image_digest_or_tag,
             checklist.equivalent_non_secret_config,
             checklist.dependencies_available,
-            has_digest || image_refs.is_empty(),
+            all_resolved,
         ];
         flags.iter().filter(|x| **x).count() as f64 / flags.len() as f64
     };
