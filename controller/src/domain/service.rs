@@ -824,7 +824,7 @@ where
 {
     let deadline = Instant::now() + budget;
     let mut observed = ImageDigests::new();
-    if expected_images.is_empty() {
+    if unresolved_images(expected_images, &observed).is_empty() {
         return observed;
     }
     loop {
@@ -852,12 +852,22 @@ fn unresolved_images<'a>(expected: &'a [String], digests: &ImageDigests) -> Vec<
     expected
         .iter()
         .filter(|image| {
-            !digests
-                .get(*image)
-                .is_some_and(|digest| digest.contains("@sha256:"))
+            !is_digest_pinned(image)
+                && !digests
+                    .get(*image)
+                    .is_some_and(|digest| digest.contains("@sha256:"))
         })
         .map(String::as_str)
         .collect()
+}
+
+fn is_digest_pinned(image: &str) -> bool {
+    let Some((repository, digest)) = image.rsplit_once("@sha256:") else {
+        return false;
+    };
+    !repository.is_empty()
+        && digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn image_digest_gaps(expected: &[String], digests: &ImageDigests) -> Vec<String> {
@@ -1059,6 +1069,70 @@ mod digest_poll_tests {
                 "image digests not resolved; tags only: busybox:1.37.0",
                 "image digests not resolved; tags only: busybox:1.36.1"
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn digest_pinned_images_skip_runtime_lookup_without_gaps() {
+        let images = vec![format!(
+            "registry.example:5000/app@sha256:{}",
+            "a".repeat(64)
+        )];
+        let calls = Cell::new(0);
+        let result = poll_image_digests(
+            &images,
+            Duration::from_secs(60),
+            Duration::from_millis(500),
+            || {
+                calls.set(calls.get() + 1);
+                async { Ok(ImageDigests::new()) }
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 0);
+        assert!(result.is_empty());
+        assert!(fidelity_gaps(&images, &result).is_empty());
+    }
+
+    #[tokio::test]
+    async fn mixed_pinned_and_tagged_images_only_wait_for_tagged_image() {
+        let images = vec![
+            format!("app@sha256:{}", "a".repeat(64)),
+            "busybox:1.36.1".into(),
+        ];
+        assert_eq!(
+            fidelity_gaps(&images, &ImageDigests::new()),
+            vec!["image digests not resolved; tags only: busybox:1.36.1"]
+        );
+        let calls = Cell::new(0);
+        let result = poll_image_digests(
+            &images,
+            Duration::from_secs(60),
+            Duration::from_millis(500),
+            || {
+                calls.set(calls.get() + 1);
+                async { Ok(resolved(true)) }
+            },
+        )
+        .await;
+        assert_eq!(calls.get(), 1);
+        assert!(!result.contains_key(&images[0]));
+        assert!(fidelity_gaps(&images, &result).is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_digest_pin_still_discloses_a_gap() {
+        let images = vec!["app@sha256:abc".into()];
+        let result = poll_image_digests(
+            &images,
+            Duration::ZERO,
+            Duration::from_millis(1),
+            || async { Ok(ImageDigests::new()) },
+        )
+        .await;
+        assert_eq!(
+            fidelity_gaps(&images, &result),
+            vec!["image digests not resolved; tags only: app@sha256:abc"]
         );
     }
 }

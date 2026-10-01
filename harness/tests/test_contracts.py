@@ -103,3 +103,21 @@ def test_finalize_response_schema_shape():
     record = _load("validated_fix_record.json")
     assert "content_hash" in record["required"]
     assert "validation" in record["required"]
+
+
+@pytest.mark.parametrize("gaps", [
+    ["image digests not resolved; tags only"],
+    ["image digests not resolved; tags only: busybox:1.37.0"],
+    ["image digests not resolved; tags only: app:v1", "image digests not resolved; tags only: sidecar:v2"],
+])
+def test_fidelity_schema_accepts_global_and_per_image_gap_messages(gaps):
+    instance = {
+        "score": 0.8,
+        "checklist": {
+            "same_commit": True, "same_render_path": True,
+            "same_image_digest_or_tag": True, "equivalent_k8s_semantics": True,
+            "equivalent_non_secret_config": True, "dependencies_available": True,
+        },
+        "material_gaps": gaps,
+    }
+    Draft202012Validator(_load("fidelity_report.json")).validate(instance)
