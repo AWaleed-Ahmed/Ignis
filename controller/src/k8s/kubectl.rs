@@ -10,8 +10,9 @@ use crate::domain::errors::DomainError;
 use crate::domain::models::ResourceRef;
 use crate::k8s::types::default_labels;
 use crate::k8s::{
-    ApplyResult, ClusterBackend, DestroyOutcome, HttpHealthResult, LogArtifact, NamespaceSpec,
-    ObservedContainerStatus, ObservedEvent, ObservedPod, RolloutStatus, WorkloadObservation,
+    ApplyResult, ClusterBackend, DestroyOutcome, HttpHealthResult, ImageDigests, LogArtifact,
+    NamespaceSpec, ObservedContainerStatus, ObservedEvent, ObservedPod, RolloutStatus,
+    WorkloadObservation,
 };
 
 pub struct KubectlCluster {
@@ -287,7 +288,7 @@ impl ClusterBackend for KubectlCluster {
         Ok(out)
     }
 
-    async fn resolve_image_digests(&self, namespace: &str) -> Result<Vec<String>, DomainError> {
+    async fn resolve_image_digests(&self, namespace: &str) -> Result<ImageDigests, DomainError> {
         let (code, pods_json, _) = self
             .run(
                 &["get", "pods", "-n", namespace, "-o", "json"],
@@ -295,7 +296,7 @@ impl ClusterBackend for KubectlCluster {
             )
             .await?;
         if code != 0 {
-            return Ok(vec![]);
+            return Ok(ImageDigests::new());
         }
         Ok(parse_image_digests(&pods_json))
     }
@@ -405,30 +406,47 @@ async fn curl_status(
     })
 }
 
-fn parse_image_digests(raw: &str) -> Vec<String> {
+fn parse_image_digests(raw: &str) -> ImageDigests {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return vec![];
+        return ImageDigests::new();
     };
-    let mut out = Vec::new();
+    let mut out = ImageDigests::new();
     let Some(items) = v.get("items").and_then(|i| i.as_array()) else {
         return out;
     };
     for item in items {
-        let statuses = item
-            .pointer("/status/containerStatuses")
-            .and_then(|x| x.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for c in statuses {
-            let image = c.get("image").and_then(|x| x.as_str()).unwrap_or("");
-            let image_id = c.get("imageID").and_then(|x| x.as_str()).unwrap_or("");
-            if let Some(digest) = image_id_to_digest(image, image_id) {
-                out.push(digest);
+        // Status image names can be registry-expanded. Match status to spec by
+        // container name and keep the original spec image as the lookup key.
+        for (spec_path, status_path) in [
+            ("/spec/containers", "/status/containerStatuses"),
+            ("/spec/initContainers", "/status/initContainerStatuses"),
+        ] {
+            let Some(containers) = item.pointer(spec_path).and_then(|x| x.as_array()) else {
+                continue;
+            };
+            let Some(statuses) = item.pointer(status_path).and_then(|x| x.as_array()) else {
+                continue;
+            };
+            for c in containers {
+                let Some(image) = c.get("image").and_then(|x| x.as_str()) else {
+                    continue;
+                };
+                let Some(name) = c.get("name").and_then(|x| x.as_str()) else {
+                    continue;
+                };
+                let Some(status) = statuses
+                    .iter()
+                    .find(|s| s.get("name").and_then(|x| x.as_str()) == Some(name))
+                else {
+                    continue;
+                };
+                let image_id = status.get("imageID").and_then(|x| x.as_str()).unwrap_or("");
+                if let Some(digest) = image_id_to_digest(image, image_id) {
+                    out.insert(image.to_string(), digest);
+                }
             }
         }
     }
-    out.sort();
-    out.dedup();
     out
 }
 
@@ -444,8 +462,58 @@ fn image_id_to_digest(image: &str, image_id: &str) -> Option<String> {
         return Some(digest);
     }
     // Prefer repo@sha256:...
-    let repo = image.split('@').next()?.split(':').next()?;
+    let reference = image.split('@').next()?;
+    let repo = match reference.rfind(':') {
+        Some(colon) if !reference[colon..].contains('/') => &reference[..colon],
+        _ => reference,
+    };
     Some(format!("{repo}@{digest}"))
+}
+
+#[cfg(test)]
+mod digest_lookup_tests {
+    use super::{image_id_to_digest, parse_image_digests};
+    use serde_json::json;
+
+    #[test]
+    fn matches_status_by_name_and_keeps_distinct_tags_of_same_image() {
+        let pods = json!({"items": [{
+            "spec": {"containers": [
+                {"name": "app", "image": "busybox:1.37.0"},
+                {"name": "sidecar", "image": "busybox:1.36.1"}
+            ]},
+            "status": {"containerStatuses": [
+                {"name": "sidecar", "image": "docker.io/library/busybox:1.36.1", "imageID": ""},
+                {"name": "app", "image": "docker.io/library/busybox:1.37.0", "imageID": "containerd://sha256:aaa"}
+            ]}
+        }]});
+        let digests = parse_image_digests(&pods.to_string());
+        assert_eq!(digests.len(), 1);
+        assert_eq!(digests["busybox:1.37.0"], "busybox@sha256:aaa");
+        assert!(!digests.contains_key("busybox:1.36.1"));
+    }
+
+    #[test]
+    fn includes_init_container_images_and_ignores_unmatched_status() {
+        let pods = json!({"items": [{
+            "spec": {"initContainers": [{"name": "setup", "image": "setup:v1"}]},
+            "status": {"initContainerStatuses": [
+                {"name": "setup", "imageID": "sha256:aaa"},
+                {"name": "unrelated", "image": "other:v1", "imageID": "sha256:bbb"}
+            ]}
+        }]});
+        let digests = parse_image_digests(&pods.to_string());
+        assert_eq!(digests.len(), 1);
+        assert_eq!(digests["setup:v1"], "setup@sha256:aaa");
+    }
+
+    #[test]
+    fn digest_reference_preserves_registry_port() {
+        assert_eq!(
+            image_id_to_digest("registry.example:5000/app:v1", "sha256:aaa"),
+            Some("registry.example:5000/app@sha256:aaa".into())
+        );
+    }
 }
 
 fn parse_managed_namespaces(raw: &str) -> Vec<crate::k8s::ManagedNamespace> {

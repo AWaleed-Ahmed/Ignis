@@ -337,3 +337,71 @@ fn run_static_command(workspace: Option<&str>, cmd: &str) -> Result<(i32, String
 pub fn workspace_join(workspace: &str, rel: &str) -> PathBuf {
     PathBuf::from(workspace).join(rel)
 }
+
+#[cfg(test)]
+mod fidelity_tests {
+    use super::run_validation;
+    use crate::domain::models::{FidelityReport, ValidationPlan};
+    use crate::k8s::mock::MockCluster;
+
+    #[tokio::test]
+    async fn per_image_gap_prevents_full_validation_even_when_checks_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = MockCluster::with_store(temp.path()).unwrap();
+        let plan: ValidationPlan = serde_json::from_value(serde_json::json!({
+            "commands": [], "health_checks": []
+        }))
+        .unwrap();
+        let mut fidelity: FidelityReport = serde_json::from_value(serde_json::json!({
+            "score": 1.0,
+            "checklist": {
+                "same_commit": true, "same_render_path": true,
+                "same_image_digest_or_tag": true, "equivalent_k8s_semantics": true,
+                "equivalent_non_secret_config": true, "dependencies_available": true
+            },
+            "material_gaps": []
+        }))
+        .unwrap();
+        let clean = run_validation(
+            &backend,
+            "sb-test",
+            "test",
+            None,
+            &plan,
+            None,
+            None,
+            Some(&fidelity),
+        )
+        .await
+        .unwrap();
+        assert!(clean.passed);
+        assert!(clean.full_validation);
+        fidelity
+            .material_gaps
+            .push("image digests not resolved; tags only: busybox:1.37.0".into());
+        let result = run_validation(
+            &backend,
+            "sb-test",
+            "test",
+            None,
+            &plan,
+            None,
+            None,
+            Some(&fidelity),
+        )
+        .await
+        .unwrap();
+        assert!(result.passed);
+        assert!(!result.full_validation);
+        assert!(result
+            .checks
+            .iter()
+            .any(|check| check.name == "fidelity_full_claim"
+                && check.status == "failed"
+                && check
+                    .message
+                    .as_deref()
+                    .unwrap()
+                    .contains("tags only: busybox:1.37.0")));
+    }
+}
