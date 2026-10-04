@@ -121,3 +121,25 @@ def test_fidelity_schema_accepts_global_and_per_image_gap_messages(gaps):
         "material_gaps": gaps,
     }
     Draft202012Validator(_load("fidelity_report.json")).validate(instance)
+
+
+def _secret_reference(status="covered"):
+    return {"workload_kind":"Deployment", "workload_name":"app", "namespace":"sandbox", "source":"secretKeyRef", "secret_name":"db", "key":"URL", "optional":False, "status":status}
+
+
+@pytest.mark.parametrize("status", ["covered", "missing_object", "missing_key", "unknown"])
+def test_secret_coverage_contract_statuses_and_identity(status):
+    schema = _load("fidelity_report.json")["properties"]["secret_coverage"]
+    validator = Draft202012Validator(schema)
+    report = {"format_version":1, "complete":status != "unknown", "truncated":False, "references":[_secret_reference(status)]}
+    validator.validate(report)
+    assert not validator.is_valid({**report, "format_version":2})
+    assert not validator.is_valid({**report, "references":[{**_secret_reference(status), "secret_value":"forbidden"}]})
+
+
+def test_complete_coverage_cannot_be_truncated_unknown_or_missing_reference_identity():
+    validator = Draft202012Validator(_load("fidelity_report.json")["properties"]["secret_coverage"])
+    report = {"format_version":1, "complete":True, "truncated":False, "references":[_secret_reference("missing_key")]}
+    assert not validator.is_valid({**report, "truncated":True})
+    assert not validator.is_valid({**report, "references":[_secret_reference("unknown")]})
+    assert not validator.is_valid({**report, "references":[{"status":"missing_key"}]})
