@@ -45,6 +45,51 @@
     "material_gaps": {
       "type": "array",
       "items": { "type": "string" }
+    },
+    "secret_coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format_version", "complete", "truncated", "references"],
+      "properties": {
+        "format_version": { "type": "integer", "const": 1 },
+        "complete": { "type": "boolean" },
+        "truncated": { "type": "boolean" },
+        "references": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["workload_kind", "workload_name", "namespace", "source", "optional", "status"],
+            "properties": {
+              "namespace": { "type": "string", "minLength": 1 },
+              "source": { "type": "string", "enum": ["secretKeyRef", "envFrom.secretRef", "volumes.secret", "volumes.projected.secret"] },
+              "optional": { "type": "boolean" },
+              "status": { "type": "string", "enum": ["covered", "missing_object", "missing_key", "unknown"] },
+              "secret_name": { "type": ["string", "null"], "minLength": 1 },
+              "key": { "type": ["string", "null"], "minLength": 1 },
+              "workload_kind": { "type": "string", "minLength": 1 },
+              "workload_name": { "type": "string" },
+              "owner_kind": { "type": ["string", "null"] },
+              "owner_name": { "type": ["string", "null"] }
+            },
+            "allOf": [
+              {
+                "if": { "properties": { "status": { "enum": ["covered", "missing_object", "missing_key"] } } },
+                "then": { "required": ["secret_name"], "properties": { "secret_name": { "type": "string" }, "workload_name": { "minLength": 1 } } }
+              },
+              {
+                "if": { "properties": { "source": { "const": "secretKeyRef" }, "status": { "enum": ["covered", "missing_object", "missing_key"] } } },
+                "then": { "required": ["key"], "properties": { "key": { "type": "string" } } }
+              }
+            ]
+          }
+        }
+      },
+      "allOf": [{
+        "if": { "properties": { "complete": { "const": true } } },
+        "then": { "properties": { "truncated": { "const": false }, "references": { "items": { "properties": { "status": { "enum": ["covered", "missing_object", "missing_key"] } } } } } }
+      }]
     }
   }
 }

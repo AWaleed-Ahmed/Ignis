@@ -112,6 +112,7 @@ impl SqliteStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::models::{AppliedSecretFixture, AppliedSecretFixtureInventory};
     use crate::state::registry::{SandboxRecord, SandboxStatus};
     use chrono::Utc;
 
@@ -131,6 +132,7 @@ mod tests {
             cloned_workspace: None,
             target_environment: None,
             secret_fixture_set: None,
+            applied_secret_fixtures: None,
             status: SandboxStatus::Ready,
             created_at: Utc::now(),
             expires_at: Utc::now(),
@@ -149,11 +151,41 @@ mod tests {
             artifacts: vec![],
             cluster_backend: "mock".into(),
         };
+        rec.applied_secret_fixtures = Some(AppliedSecretFixtureInventory {
+            namespace: "ns".into(),
+            fixture_set: Some("payments-test".into()),
+            complete: true,
+            truncated: false,
+            secrets: vec![AppliedSecretFixture {
+                name: "payments-db".into(),
+                keys: vec!["DATABASE_URL".into()],
+            }],
+        });
         store.upsert(&rec).unwrap();
         rec.status = SandboxStatus::Destroyed;
         store.upsert(&rec).unwrap();
         let all = store.load_all().unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].status, SandboxStatus::Destroyed);
+        assert_eq!(all[0].applied_secret_fixtures, rec.applied_secret_fixtures);
+    }
+
+    #[test]
+    fn old_sandbox_documents_load_with_unknown_fixture_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        SqliteStore::open(dir.path()).unwrap();
+        let record: SandboxRecord = serde_json::from_value(serde_json::json!({
+            "sandbox_id":"old", "run_id":"run-old", "tenant_id":"t", "namespace":"ns",
+            "commit_sha":"abcdef0", "repository_owner":"o", "repository_name":"n",
+            "clone_url":null, "cloned_workspace":null, "target_environment":null,
+            "secret_fixture_set":null, "status":"ready", "created_at":"2026-01-01T00:00:00Z",
+            "expires_at":"2026-01-01T00:00:00Z", "service_account":"sa", "deployed_sha":null,
+            "rendered_yaml":null, "resources":[], "image_refs":[], "last_signature":null,
+            "reproduction_signature":null, "after_signature":null, "last_fidelity":null,
+            "last_patch":null, "last_validation":null, "finalized_result":null,
+            "artifacts":[], "cluster_backend":"mock"
+        }))
+        .unwrap();
+        assert!(record.applied_secret_fixtures.is_none());
     }
 }

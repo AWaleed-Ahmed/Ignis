@@ -74,6 +74,14 @@ impl SandboxService {
         let expires_at = now + ChronoDuration::minutes(timeout_minutes as i64);
         let service_account = "raphael-sandbox-sa".to_string();
 
+        let applied_secret_fixtures = Some(AppliedSecretFixtureInventory {
+            namespace: namespace.clone(),
+            fixture_set: req.secret_fixture_set.clone(),
+            complete: req.secret_fixture_set.is_none(),
+            truncated: false,
+            secrets: vec![],
+        });
+
         let spec = NamespaceSpec {
             namespace: namespace.clone(),
             sandbox_id: sandbox_id.clone(),
@@ -99,6 +107,7 @@ impl SandboxService {
             cloned_workspace: None,
             target_environment: req.target_environment,
             secret_fixture_set: req.secret_fixture_set.clone(),
+            applied_secret_fixtures,
             status: SandboxStatus::Ready,
             created_at: now,
             expires_at,
@@ -123,11 +132,24 @@ impl SandboxService {
             .map_err(DomainError::Conflict)?;
 
         if let Some(fixture_set) = &req.secret_fixture_set {
-            let secrets_yaml = crate::fixtures::load_secret_fixture_yaml(fixture_set)?;
+            let (secrets_yaml, fixture_metadata) =
+                crate::fixtures::load_secret_fixture(fixture_set)?;
             crate::policy::check_manifest_policy(&secrets_yaml)?;
             self.backend
                 .apply_secret_fixtures(&namespace, &secrets_yaml)
                 .await?;
+            let (secrets, truncated) = bounded_fixture_metadata(fixture_metadata);
+            self.registry
+                .update(&sandbox_id, |r| {
+                    r.applied_secret_fixtures = Some(AppliedSecretFixtureInventory {
+                        namespace: namespace.clone(),
+                        fixture_set: Some(fixture_set.clone()),
+                        complete: !truncated,
+                        truncated,
+                        secrets: secrets.clone(),
+                    });
+                })
+                .map_err(DomainError::Internal)?;
             let art = store_artifact(
                 &sandbox_id,
                 "secret_fixture",
@@ -223,6 +245,7 @@ impl SandboxService {
             &rendered.render_path,
             &apply.image_refs,
             &digests,
+            &rendered.yaml,
         );
         let now = Utc::now();
         let tools_blob = serde_json::to_string_pretty(&tool_versions).unwrap_or_default();
@@ -549,6 +572,7 @@ impl SandboxService {
                 self.registry
                     .update(sandbox_id, |r| {
                         r.status = SandboxStatus::Destroyed;
+                        r.applied_secret_fixtures = None;
                     })
                     .map_err(DomainError::Internal)?;
                 Ok(DestroySandboxResponse {
@@ -616,6 +640,7 @@ impl SandboxService {
                 if let Some(sid) = &ns.sandbox_id {
                     let _ = self.registry.update(sid, |r| {
                         r.status = SandboxStatus::Destroyed;
+                        r.applied_secret_fixtures = None;
                     });
                     let _ = crate::artifacts::purge_sandbox_artifacts(sid);
                 }
@@ -658,6 +683,7 @@ impl SandboxService {
                 if &r.namespace == ns {
                     let _ = self.registry.update(&r.sandbox_id, |rec| {
                         rec.status = SandboxStatus::Destroyed;
+                        rec.applied_secret_fixtures = None;
                     });
                     destroyed_sandboxes.push(r.sandbox_id);
                 }
@@ -913,7 +939,7 @@ mod digest_poll_tests {
             "repository_sha": "abc", "manifests": {"type": "yaml", "path": "app.yaml"}
         }))
         .unwrap();
-        build_fidelity(&record, &req, "yaml", images, digests).material_gaps
+        build_fidelity(&record, &req, "yaml", images, digests, "").material_gaps
     }
 
     #[tokio::test]
@@ -1143,6 +1169,7 @@ fn build_fidelity(
     render_path: &str,
     expected_images: &[String],
     digests: &ImageDigests,
+    rendered_yaml: &str,
 ) -> FidelityReport {
     let same_commit = record.commit_sha.starts_with(&req.repository_sha)
         || req.repository_sha.starts_with(&record.commit_sha);
@@ -1171,6 +1198,24 @@ fn build_fidelity(
         gaps.extend(image_gaps);
         complete
     };
+    let secret_coverage = crate::secret_coverage::evaluate_secret_coverage(
+        rendered_yaml,
+        &record.namespace,
+        record.applied_secret_fixtures.as_ref(),
+    );
+    if secret_coverage.references.iter().any(|reference| {
+        !reference.optional
+            && matches!(
+                reference.status,
+                SecretCoverageStatus::MissingObject | SecretCoverageStatus::MissingKey
+            )
+    }) {
+        gaps.push(
+            "required Secret references are not covered by applied synthetic fixtures".into(),
+        );
+    } else if !secret_coverage.complete {
+        gaps.push("Secret fixture coverage is incomplete or unknown".into());
+    }
     let checklist = FidelityChecklist {
         same_commit,
         same_render_path: !render_path.is_empty(),
@@ -1195,7 +1240,36 @@ fn build_fidelity(
         checklist,
         substitutions,
         material_gaps: gaps,
+        secret_coverage: Some(secret_coverage),
     }
+}
+
+fn bounded_fixture_metadata(
+    metadata: Vec<crate::fixtures::FixtureSecretMetadata>,
+) -> (Vec<AppliedSecretFixture>, bool) {
+    const MAX_SECRETS: usize = 128;
+    const MAX_KEYS: usize = 1_024;
+
+    let mut secrets = Vec::new();
+    let mut key_count = 0;
+    let mut truncated = metadata.len() > MAX_SECRETS;
+    for secret in metadata.into_iter().take(MAX_SECRETS) {
+        if key_count == MAX_KEYS && !secret.keys.is_empty() {
+            truncated = true;
+            break;
+        }
+        let remaining = MAX_KEYS - key_count;
+        if secret.keys.len() > remaining {
+            truncated = true;
+        }
+        let keys = secret.keys.into_iter().take(remaining).collect::<Vec<_>>();
+        key_count += keys.len();
+        secrets.push(AppliedSecretFixture {
+            name: secret.name,
+            keys,
+        });
+    }
+    (secrets, truncated)
 }
 
 fn compute_result_hash(
@@ -1221,4 +1295,113 @@ fn compute_result_hash(
 
 fn self_is_mock(record: &SandboxRecord) -> bool {
     record.cluster_backend == "mock"
+}
+
+#[cfg(test)]
+mod secret_inventory_tests {
+    use super::*;
+    use crate::k8s::mock::MockCluster;
+    use crate::state::sqlite::SqliteStore;
+
+    fn create_request(run_id: &str, fixture: Option<&str>) -> CreateSandboxRequest {
+        serde_json::from_value(serde_json::json!({
+            "run_id": run_id, "tenant_id": "test", "repository": {"owner":"test", "name":"test"},
+            "commit_sha": "abcdef0123456789", "secret_fixture_set": fixture
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn applied_inventory_survives_registry_restart_and_is_cleared_at_destroy() {
+        let data = tempfile::tempdir().unwrap();
+        let store = Arc::new(SqliteStore::open(data.path().join("records")).unwrap());
+        let backend = Arc::new(MockCluster::with_store(data.path()).unwrap());
+        let registry = Arc::new(SandboxRegistry::with_store(store.clone()).unwrap());
+        let service = SandboxService::new(backend.clone(), registry.clone());
+        let created = service
+            .create_sandbox(create_request("coverage-restart", Some("payments-test")))
+            .await
+            .unwrap();
+        let saved = registry
+            .get(&created.sandbox_id)
+            .unwrap()
+            .applied_secret_fixtures
+            .unwrap();
+        assert!(saved.complete);
+        assert!(saved
+            .secrets
+            .iter()
+            .any(|secret| secret.name == "payments-db"
+                && secret.keys.contains(&"DATABASE_URL".into())));
+        let restored = Arc::new(SandboxRegistry::with_store(store.clone()).unwrap());
+        assert_eq!(
+            restored
+                .get(&created.sandbox_id)
+                .unwrap()
+                .applied_secret_fixtures,
+            Some(saved)
+        );
+        let restarted = SandboxService::new(backend, restored.clone());
+        restarted
+            .destroy_sandbox(&created.sandbox_id, DestroySandboxRequest { reason: None })
+            .await
+            .unwrap();
+        assert!(restored
+            .get(&created.sandbox_id)
+            .unwrap()
+            .applied_secret_fixtures
+            .is_none());
+        assert!(store.load_all().unwrap()[0]
+            .applied_secret_fixtures
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn no_selection_is_known_empty_but_failed_selection_stays_incomplete() {
+        let registry = Arc::new(SandboxRegistry::new());
+        let service = SandboxService::new(Arc::new(MockCluster::new()), registry.clone());
+        let empty = service
+            .create_sandbox(create_request("coverage-empty", None))
+            .await
+            .unwrap();
+        let inventory = registry
+            .get(&empty.sandbox_id)
+            .unwrap()
+            .applied_secret_fixtures
+            .unwrap();
+        assert!(inventory.complete && inventory.secrets.is_empty());
+        assert!(service
+            .create_sandbox(create_request(
+                "coverage-failed",
+                Some("nonexistent-coverage-fixture")
+            ))
+            .await
+            .is_err());
+        let failed = registry
+            .get(&sandbox_id_from_run("coverage-failed"))
+            .unwrap()
+            .applied_secret_fixtures
+            .unwrap();
+        assert!(!failed.complete && failed.secrets.is_empty());
+    }
+
+    #[test]
+    fn inventory_limits_preserve_only_bounded_metadata_and_disclose_truncation() {
+        let metadata = (0..129)
+            .map(|index| crate::fixtures::FixtureSecretMetadata {
+                name: format!("secret-{index}"),
+                keys: vec!["KEY".into()],
+            })
+            .collect();
+        let (secrets, truncated) = bounded_fixture_metadata(metadata);
+        assert_eq!(secrets.len(), 128);
+        assert!(truncated);
+        let (secrets, truncated) =
+            bounded_fixture_metadata(vec![crate::fixtures::FixtureSecretMetadata {
+                name: "db".into(),
+                keys: (0..1025).map(|index| format!("KEY{index}")).collect(),
+            }]);
+        assert_eq!(secrets[0].keys.len(), 1024);
+        assert!(truncated);
+    }
 }

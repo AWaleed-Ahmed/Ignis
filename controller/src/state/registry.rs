@@ -5,8 +5,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::models::{
-    ArtifactRecord, FailureSignature, FidelityReport, PatchSpec, ResourceRef, ValidatedFixRecord,
-    ValidationResults,
+    AppliedSecretFixtureInventory, ArtifactRecord, FailureSignature, FidelityReport, PatchSpec,
+    ResourceRef, ValidatedFixRecord, ValidationResults,
 };
 use crate::state::sqlite::SqliteStore;
 
@@ -31,6 +31,8 @@ pub struct SandboxRecord {
     pub cloned_workspace: Option<String>,
     pub target_environment: Option<String>,
     pub secret_fixture_set: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_secret_fixtures: Option<AppliedSecretFixtureInventory>,
     pub status: SandboxStatus,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,

@@ -13,6 +13,7 @@ pub mod k8s;
 pub mod observe;
 pub mod policy;
 pub mod render;
+pub mod secret_coverage;
 pub mod security_context;
 pub mod state;
 pub mod tools;

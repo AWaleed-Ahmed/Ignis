@@ -21,6 +21,12 @@ struct FixtureSecret {
     labels: std::collections::HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FixtureSecretMetadata {
+    pub name: String,
+    pub keys: Vec<String>,
+}
+
 /// Resolve fixtures directory: RAPHAEL_FIXTURES_DIR or <repo>/sandbox/fixtures/secret_fixtures
 pub fn fixtures_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("RAPHAEL_FIXTURES_DIR") {
@@ -30,11 +36,20 @@ pub fn fixtures_dir() -> PathBuf {
 }
 
 pub fn load_secret_fixture_yaml(set_name: &str) -> Result<String, DomainError> {
-    let path = fixtures_dir().join(format!("{set_name}.json"));
-    load_secret_fixture_yaml_from_path(&path, set_name)
+    load_secret_fixture(set_name).map(|(yaml, _)| yaml)
 }
 
-fn load_secret_fixture_yaml_from_path(path: &Path, set_name: &str) -> Result<String, DomainError> {
+pub fn load_secret_fixture(
+    set_name: &str,
+) -> Result<(String, Vec<FixtureSecretMetadata>), DomainError> {
+    let path = fixtures_dir().join(format!("{set_name}.json"));
+    load_secret_fixture_from_path(&path, set_name)
+}
+
+fn load_secret_fixture_from_path(
+    path: &Path,
+    set_name: &str,
+) -> Result<(String, Vec<FixtureSecretMetadata>), DomainError> {
     let raw = std::fs::read_to_string(path).map_err(|e| {
         DomainError::InvalidRequest(format!(
             "secret fixture set `{set_name}` not found at {}: {e}",
@@ -44,6 +59,29 @@ fn load_secret_fixture_yaml_from_path(path: &Path, set_name: &str) -> Result<Str
     let file: FixtureFile = serde_json::from_str(&raw)
         .map_err(|e| DomainError::InvalidRequest(format!("invalid fixture JSON: {e}")))?;
 
+    let mut names = std::collections::HashSet::new();
+    if file
+        .secrets
+        .iter()
+        .any(|secret| !names.insert(&secret.name))
+    {
+        return Err(DomainError::InvalidRequest(
+            "fixture set contains duplicate Secret names".into(),
+        ));
+    }
+
+    let metadata = file
+        .secrets
+        .iter()
+        .map(|secret| {
+            let mut keys = secret.data.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            FixtureSecretMetadata {
+                name: secret.name.clone(),
+                keys,
+            }
+        })
+        .collect::<Vec<_>>();
     let mut docs = Vec::new();
     for secret in file.secrets {
         let mut labels = secret.labels;
@@ -81,12 +119,20 @@ stringData:
             "fixture set `{set_name}` contains no secrets"
         )));
     }
-    Ok(docs.join("---\n"))
+    Ok((docs.join("---\n"), metadata))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_secret_names_are_rejected_before_application() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("duplicate.json");
+        std::fs::write(&path, r#"{"name":"duplicate","secrets":[{"name":"db","data":{"URL":"first"}},{"name":"db","data":{"PASSWORD":"second"}}]}"#).unwrap();
+        assert!(load_secret_fixture_from_path(&path, "duplicate").is_err());
+    }
 
     #[test]
     fn loads_payments_test_fixture() {
@@ -95,5 +141,16 @@ mod tests {
         assert!(yaml.contains("raphael.secret_fixture: \"true\""));
         assert!(yaml.contains("payments-db"));
         assert!(yaml.contains("DATABASE_URL"));
+    }
+
+    #[test]
+    fn fixture_metadata_contains_names_and_keys_but_not_values() {
+        let (yaml, metadata) = load_secret_fixture("payments-test").expect("load");
+        assert!(metadata
+            .iter()
+            .any(|secret| { secret.name == "payments-db" && secret.keys == ["DATABASE_URL"] }));
+        let metadata_text = serde_json::to_string(&metadata).unwrap();
+        assert!(!metadata_text.contains("postgres"));
+        assert!(yaml.contains("postgres"));
     }
 }

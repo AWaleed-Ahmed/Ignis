@@ -115,6 +115,60 @@ pub struct FidelitySubstitution {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedSecretFixture {
+    pub name: String,
+    pub keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedSecretFixtureInventory {
+    pub namespace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture_set: Option<String>,
+    #[serde(default)]
+    pub complete: bool,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub secrets: Vec<AppliedSecretFixture>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretCoverageStatus {
+    Covered,
+    MissingObject,
+    MissingKey,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretReferenceCoverage {
+    pub workload_kind: String,
+    pub workload_name: String,
+    pub namespace: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    pub optional: bool,
+    pub status: SecretCoverageStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretCoverageReport {
+    pub format_version: u32,
+    pub complete: bool,
+    pub truncated: bool,
+    pub references: Vec<SecretReferenceCoverage>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FidelityReport {
     pub score: f64,
@@ -122,6 +176,8 @@ pub struct FidelityReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub substitutions: Vec<FidelitySubstitution>,
     pub material_gaps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_coverage: Option<SecretCoverageReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
