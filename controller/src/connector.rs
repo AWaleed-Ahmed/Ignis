@@ -202,6 +202,8 @@ pub enum ConnectorError {
     Unsupported(String),
     #[error("controller execution failed: {0}")]
     Execution(String),
+    #[error("controller execution timed out: {0}")]
+    Timeout(String),
     #[error("lease expired for job {0}")]
     LeaseExpired(String),
 }
@@ -247,7 +249,11 @@ pub struct ControllerExecutor {
 impl ControllerExecutor {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(300))
+                .build()
+                .expect("local controller HTTP client configuration is valid"),
             base_url: base_url.into().trim_end_matches('/').to_string(),
         }
     }
@@ -257,23 +263,26 @@ impl ControllerExecutor {
         path: &str,
         body: Value,
         action_id: Option<&str>,
+        budget: Duration,
     ) -> Result<Value, ConnectorError> {
         let mut request = self
             .client
             .post(format!("{}{}", self.base_url, path))
-            .json(&body);
+            .json(&body)
+            .timeout(budget);
         if let Some(action_id) = action_id {
             request = request.header("x-raphael-connector-action-id", action_id);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ConnectorError::Execution(e.to_string()))?;
+        let response = request.send().await.map_err(controller_http_error)?;
         let status = response.status();
-        let payload: Value = response
-            .json()
-            .await
-            .map_err(|e| ConnectorError::Execution(e.to_string()))?;
+        let payload: Value = response.json().await.map_err(controller_http_error)?;
+        if status == reqwest::StatusCode::GATEWAY_TIMEOUT
+            || payload.pointer("/error/code").and_then(Value::as_str) == Some("timeout")
+        {
+            return Err(ConnectorError::Timeout(
+                "controller deadline exhausted".into(),
+            ));
+        }
         if !status.is_success() {
             return Err(ConnectorError::Execution(payload.to_string()));
         }
@@ -323,7 +332,24 @@ impl ActionExecutor for ControllerExecutor {
                 endpoint_suffix(&action.verb)?
             )
         };
-        let result = self.post(&path, body, Some(&action.action_id)).await?;
+        let budget = if action.verb == "deploy_revision" {
+            let seconds = action
+                .args
+                .get("deploy_timeout_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(crate::domain::models::default_deploy_timeout_seconds() as u64);
+            if !(1..=600).contains(&seconds) {
+                return Err(ConnectorError::Malformed(
+                    "deploy_timeout_seconds must be 1..600".into(),
+                ));
+            }
+            Duration::from_secs(seconds + 10)
+        } else {
+            Duration::from_secs(300)
+        };
+        let result = self
+            .post(&path, body, Some(&action.action_id), budget)
+            .await?;
         validate_response(&action.verb, &result)?;
         let _ = job;
         Ok(result)
@@ -335,7 +361,12 @@ impl ActionExecutor for ControllerExecutor {
         };
         let path = format!("/v1/sandboxes/{sandbox_id}/destroy");
         let result = self
-            .post(&path, json!({"reason": "connector_terminal"}), None)
+            .post(
+                &path,
+                json!({"reason": "connector_terminal"}),
+                None,
+                Duration::from_secs(70),
+            )
             .await?;
         validate_response("destroy_sandbox", &result)
     }
@@ -753,26 +784,37 @@ where
             return Ok(vec![cached.frame.clone()]);
         }
         let result = match action.verb.as_str() {
-            "create_sandbox" => {
-                let value = self.executor.execute(&local.job, local, &action).await?;
-                validate_response("create_sandbox", &value)?;
-                local.sandbox_id = value
-                    .get("sandbox_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                if let Some(mut record) = self.recovery.job(&action.job_id) {
-                    record.sandbox_id = local.sandbox_id.clone();
-                    record.updated_at = Utc::now();
-                    self.recovery
-                        .save_job(record)
-                        .map_err(ConnectorError::Execution)?;
+            "create_sandbox" => match self.executor.execute(&local.job, local, &action).await {
+                Ok(value) => {
+                    validate_response("create_sandbox", &value)?;
+                    local.sandbox_id = value
+                        .get("sandbox_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if let Some(mut record) = self.recovery.job(&action.job_id) {
+                        record.sandbox_id = local.sandbox_id.clone();
+                        record.updated_at = Utc::now();
+                        self.recovery
+                            .save_job(record)
+                            .map_err(ConnectorError::Execution)?;
+                    }
+                    Ok(value)
                 }
-                Ok(value)
-            }
+                Err(error) => Err(error),
+            },
             _ => self.executor.execute(&local.job, local, &action).await,
         };
         let frame = match result {
             Ok(value) => self.result_frame(&action, "ok", Some(value), None),
+            Err(ConnectorError::Timeout(message)) => self.result_frame(
+                &action,
+                "timeout",
+                None,
+                Some(ErrorBody {
+                    code: "controller_timeout".into(),
+                    message,
+                }),
+            ),
             Err(ConnectorError::LeaseExpired(message)) => self.result_frame(
                 &action,
                 "timeout",
@@ -1287,11 +1329,20 @@ fn validate_response(verb: &str, value: &Value) -> Result<(), ConnectorError> {
     Ok(())
 }
 
+fn controller_http_error(error: reqwest::Error) -> ConnectorError {
+    if error.is_timeout() {
+        ConnectorError::Timeout("local controller request deadline exhausted".into())
+    } else {
+        ConnectorError::Execution(error.to_string())
+    }
+}
+
 fn error_code(error: &ConnectorError) -> &'static str {
     match error {
         ConnectorError::Malformed(_) => "malformed_envelope",
         ConnectorError::Unsupported(_) => "internal_error",
         ConnectorError::Execution(_) => "internal_error",
+        ConnectorError::Timeout(_) => "controller_timeout",
         ConnectorError::LeaseExpired(_) => "job_lease_expired",
     }
 }
