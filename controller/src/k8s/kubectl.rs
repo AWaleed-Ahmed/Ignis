@@ -702,6 +702,8 @@ fn parse_events_json(raw: &str) -> Vec<ObservedEvent> {
         .into_iter()
         .flatten()
         .map(|item| ObservedEvent {
+            message_complete: json_string(item, "/message")
+                .is_some_and(|text| text.chars().count() <= 2048),
             reason: json_string(item, "/reason").unwrap_or_default(),
             message: crate::observe::image_pull::safe_excerpt(
                 &json_string(item, "/message").unwrap_or_default(),
@@ -765,6 +767,8 @@ fn parse_pods_json(raw: &str) -> Vec<ObservedPod> {
                         })
                         .and_then(|spec| json_string(spec, "/image"));
                     statuses.push(ObservedContainerStatus {
+                        message_complete: json_string(c, "/state/waiting/message")
+                            .is_some_and(|text| text.chars().count() <= 2048),
                         name,
                         is_init,
                         ready: c.get("ready").and_then(|v| v.as_bool()).unwrap_or(false),

@@ -29,6 +29,7 @@ pub struct WorkloadObservation {
 
 #[derive(Debug, Clone, Default)]
 pub struct ObservedEvent {
+    pub message_complete: bool,
     pub involved_uid: Option<String>,
     pub observed_at: Option<DateTime<Utc>>,
     pub reason: String,
@@ -50,6 +51,7 @@ pub struct ObservedPod {
 
 #[derive(Debug, Clone, Default)]
 pub struct ObservedContainerStatus {
+    pub message_complete: bool,
     pub is_init: bool,
     pub name: String,
     pub ready: bool,

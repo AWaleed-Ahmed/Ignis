@@ -77,15 +77,17 @@ pub fn analyze(obs: &WorkloadObservation) -> Option<AnalyzedSignature> {
                 continue;
             };
             let mut messages = Vec::new();
-            if let Some(message) = c.waiting_message.as_deref() {
-                messages.push(message);
+            if c.message_complete {
+                if let Some(message) = c.waiting_message.as_deref() {
+                    messages.push(message);
+                }
             }
             // Events only supplement a status when they identify this current
             // Pod UID and quote the original image. Namespace-wide guesses fail closed.
             if let (Some(uid), Some(created), Some(image)) = (&pod.uid, pod.created_at, &c.image) {
                 let quoted_image = format!("\"{image}\"");
                 for event in &obs.events {
-                    if event.involved_kind == "Pod" && event.involved_uid.as_ref() == Some(uid)
+                    if event.message_complete && event.involved_kind == "Pod" && event.involved_uid.as_ref() == Some(uid)
                         && event.involved_name == pod.name && event.observed_at.is_some_and(|time| time >= created && time >= chrono::Utc::now() - chrono::Duration::minutes(5))
                         && event.message.contains(&quoted_image)
                         // An image shared by two containers does not identify which failed.
@@ -95,7 +97,11 @@ pub fn analyze(obs: &WorkloadObservation) -> Option<AnalyzedSignature> {
                     }
                 }
             }
-            let cause = cause(&messages.join("\n"));
+            let cause = if c.waiting_message.is_some() && !c.message_complete {
+                "unknown"
+            } else {
+                cause(&messages.join("\n"))
+            };
             let class = match cause {
                 "not_found" => "bad_image_reference",
                 "auth" => "auth_denied",
