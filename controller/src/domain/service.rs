@@ -351,7 +351,11 @@ impl SandboxService {
         sandbox_id: &str,
         req: ObserveFailureRequest,
     ) -> Result<ObserveFailureResponse, DomainError> {
-        let _operation = self.lock_sandbox(sandbox_id).await?;
+        let deadline =
+            crate::deadline::Deadline::new(Duration::from_secs(req.timeout_seconds as u64));
+        let _operation = timeout(deadline.remaining()?, self.lock_sandbox(sandbox_id))
+            .await
+            .map_err(|_| DomainError::Timeout("observation lock deadline exhausted".into()))??;
         let record = self.require_ready(sandbox_id)?;
         if record.rendered_yaml.is_none() {
             return Err(DomainError::ObservationFailed(
@@ -360,10 +364,7 @@ impl SandboxService {
         }
         let obs = self
             .backend
-            .observe_workload(
-                &record.namespace,
-                Duration::from_secs(req.timeout_seconds as u64),
-            )
+            .observe_workload(&record.namespace, deadline.remaining()?)
             .await?;
 
         let signature = observe::observe(&obs, record.rendered_yaml.as_deref());
@@ -396,24 +397,29 @@ impl SandboxService {
                 .map_err(DomainError::Internal)?;
         }
 
-        // Bounded pod logs.
-        if let Ok(logs) = self
-            .backend
-            .collect_pod_logs(&record.namespace, 8_192)
+        // Optional logs use the same deadline as observation and lock acquisition.
+        if let Ok(remaining) = deadline.remaining() {
+            if let Ok(Ok(logs)) = timeout(
+                remaining,
+                self.backend
+                    .collect_pod_logs(&record.namespace, 8_192, remaining),
+            )
             .await
-        {
-            for log in logs {
-                let content = format!(
-                    "pod={} container={}\n{}",
-                    log.pod, log.container, log.content
-                );
-                let art = store_artifact(sandbox_id, "container_log", &content);
-                artifact_ids.push(art.id.clone());
-                self.registry
-                    .update(sandbox_id, |r| {
-                        r.artifacts.push(art);
-                    })
-                    .map_err(DomainError::Internal)?;
+            {
+                for log in logs {
+                    if deadline.remaining().is_err() {
+                        break;
+                    }
+                    let content = format!(
+                        "pod={} container={}\n{}",
+                        log.pod, log.container, log.content
+                    );
+                    let art = store_artifact(sandbox_id, "container_log", &content);
+                    artifact_ids.push(art.id.clone());
+                    self.registry
+                        .update(sandbox_id, |r| r.artifacts.push(art))
+                        .map_err(DomainError::Internal)?;
+                }
             }
         }
 

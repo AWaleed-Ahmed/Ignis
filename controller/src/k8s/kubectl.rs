@@ -274,11 +274,13 @@ impl ClusterBackend for KubectlCluster {
         &self,
         namespace: &str,
         max_bytes_per_pod: usize,
+        budget: Duration,
     ) -> Result<Vec<LogArtifact>, DomainError> {
+        let deadline = crate::deadline::Deadline::new(budget);
         let (code, pods_json, stderr) = self
             .run(
                 &["get", "pods", "-n", namespace, "-o", "json"],
-                Duration::from_secs(30),
+                deadline.cap(Duration::from_secs(30))?,
             )
             .await?;
         if code != 0 {
@@ -287,6 +289,9 @@ impl ClusterBackend for KubectlCluster {
         let pods = parse_pods_json(&pods_json);
         let mut out = Vec::new();
         for pod in pods {
+            if deadline.remaining().is_err() {
+                break;
+            }
             let container = pod
                 .container_statuses
                 .first()
@@ -304,7 +309,7 @@ impl ClusterBackend for KubectlCluster {
                         "--tail=200",
                         "--timestamps=true",
                     ],
-                    Duration::from_secs(30),
+                    deadline.cap(Duration::from_secs(30))?,
                 )
                 .await?;
             let mut content = if code == 0 {
@@ -313,7 +318,11 @@ impl ClusterBackend for KubectlCluster {
                 format!("log_unavailable: {stderr}")
             };
             if content.len() > max_bytes_per_pod {
-                content.truncate(max_bytes_per_pod);
+                let mut end = max_bytes_per_pod;
+                while !content.is_char_boundary(end) {
+                    end -= 1;
+                }
+                content.truncate(end);
             }
             out.push(LogArtifact {
                 pod: pod.name,

@@ -332,6 +332,7 @@ impl ClusterBackend for MockCluster {
         &self,
         namespace: &str,
         max_bytes_per_pod: usize,
+        _budget: Duration,
     ) -> Result<Vec<LogArtifact>, DomainError> {
         let obs = self
             .observe_workload(namespace, Duration::from_secs(1))
