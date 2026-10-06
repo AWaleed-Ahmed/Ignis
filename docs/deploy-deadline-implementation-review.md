@@ -12,6 +12,18 @@ Branch: `codex/ignis-deploy-deadline`, based on `176a13e`.
 | `0dbac04` | Add independent deployment budget and share it across clone, rendering, apply and digest collection. Clean failed clone workspaces. |
 | `380f0db` | Explicit local HTTP connect/request bounds; distinguish controller timeout from lease expiry and cache create-action failures as results. |
 
+## Review fixes (2026-10-06)
+
+| Commit | Finding addressed | Implementation |
+| --- | --- | --- |
+| `2db1d2b` | Stale success evidence after apply/timeout | Serialize deployment/observation/validation/finalization per sandbox. Before apply, clear candidate-specific deployed/rendered state, fidelity, patch, signatures, validation and finalized result. Preserve reproduction evidence for before/after comparisons. Validation rejects an incomplete/uncertain deployment. |
+| `9a2c9a8` | Lost cleanup ownership after create timeout | Persist deterministic sandbox ID before create RPC. Register controller ownership before namespace creation. Create and destroy share the sandbox operation lock, ordering cleanup after in-flight creation. Journal terminal cleanup intent before cleanup; retry retained failed cleanup on restart. Missing workspace during retry is already cleaned. |
+| `33e10dd` | Changed pre-upgrade deploy receipt hashes | Omit the default 120-second budget from request serialization, preserving the prior controller's canonical hash. Non-default budgets remain in the hash and cannot replay as a different budget. |
+
+These are implementation fixes, not behavioral test passes. All Rust targets compiled after each fix; `cargo fmt` and `git diff --check` completed. No tests were added or run. #17 remains in progress.
+
+Additional behavioral controls pending: finalized candidate followed by timed-out apply; concurrent validation/finalization during deploy; create response lost followed by terminal cleanup; restart after failed cleanup; old controller receipt replay with omitted/default timeout; rejection of non-default budget changes.
+
 ## Current semantics
 
 - New optional request field `deploy_timeout_seconds`: default 120, valid range 1–600 seconds. Both schema and controller enforce the range.
@@ -29,7 +41,7 @@ Branch: `codex/ignis-deploy-deadline`, based on `176a13e`.
 | --- | --- |
 | `cargo fmt --manifest-path controller/Cargo.toml` | Completed after each code step. |
 | `cargo check --manifest-path controller/Cargo.toml --offline` | Passed after each code step. |
-| `cargo check --manifest-path controller/Cargo.toml --all-targets --offline` | Passed at `380f0db` content, including compilation of existing test targets. |
+| `cargo check --manifest-path controller/Cargo.toml --all-targets --offline` | Passed at `380f0db` content and after each review fix through `33e10dd`, including compilation of existing test targets. |
 | `git diff --check` | Passed for each implementation step. |
 
 No tests were added or executed in this implementation batch. Compilation of test targets is not a test pass. No hosted Actions, kind proof, PR, contract release, push or merge was performed.
