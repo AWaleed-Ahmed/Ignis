@@ -148,6 +148,18 @@ impl RecoveryStore {
             .map(|j| j.values().filter(|x| !x.terminal).cloned().collect())
             .unwrap_or_default()
     }
+    pub fn cleanup_jobs(&self) -> Vec<ConnectorJobRecord> {
+        self.jobs
+            .lock()
+            .map(|jobs| {
+                jobs.values()
+                    .filter(|record| record.terminal && record.cleanup_failed)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn remove_job(&self, job_id: &str) -> Result<(), String> {
         self.jobs
             .lock()

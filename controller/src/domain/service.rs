@@ -86,6 +86,7 @@ impl SandboxService {
         }
 
         let sandbox_id = sandbox_id_from_run(&req.run_id);
+        let _operation = self.lock_sandbox(&sandbox_id).await?;
         let namespace = namespace_for_run(&req.run_id)?;
         let now = Utc::now();
         let timeout_minutes = req.timeout_minutes.clamp(1, 120);
@@ -110,8 +111,6 @@ impl SandboxService {
             cpu_limit: "2".into(),
             memory_limit: "2Gi".into(),
         };
-
-        self.backend.create_isolated_namespace(&spec).await?;
 
         let record = SandboxRecord {
             sandbox_id: sandbox_id.clone(),
@@ -148,6 +147,10 @@ impl SandboxService {
         self.registry
             .insert(record)
             .map_err(DomainError::Conflict)?;
+
+        // Register ownership before creating anything so cancellation or a lost
+        // response still leaves an identity that terminal cleanup can destroy.
+        self.backend.create_isolated_namespace(&spec).await?;
 
         if let Some(fixture_set) = &req.secret_fixture_set {
             let (secrets_yaml, fixture_metadata) =
@@ -616,6 +619,7 @@ impl SandboxService {
         sandbox_id: &str,
         _req: DestroySandboxRequest,
     ) -> Result<DestroySandboxResponse, DomainError> {
+        let _operation = self.lock_sandbox(sandbox_id).await?;
         let now = Utc::now();
         let existing = self.registry.get(sandbox_id);
         match existing {

@@ -431,6 +431,21 @@ where
     }
 
     pub async fn rehydrate(&self) -> Result<(), ConnectorError> {
+        for record in self.recovery.cleanup_jobs() {
+            let local = LocalJob {
+                job: serde_json::from_value(record.job.clone())
+                    .map_err(|e| ConnectorError::Malformed(e.to_string()))?,
+                workspace_path: PathBuf::from(record.workspace_path.as_deref().unwrap_or("")),
+                sandbox_id: record.sandbox_id.clone(),
+                terminal: true,
+                processed_actions: HashMap::new(),
+            };
+            if self.cleanup_local_job(&local).await {
+                self.recovery
+                    .remove_job(&record.job_id)
+                    .map_err(ConnectorError::Execution)?;
+            }
+        }
         for record in self.recovery.active_jobs() {
             self.restore_job(&record.job_id).await?;
         }
@@ -783,6 +798,30 @@ where
             }
             return Ok(vec![cached.frame.clone()]);
         }
+        if action.verb == "create_sandbox" {
+            let run_id = action
+                .args
+                .get("run_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ConnectorError::Malformed("create_sandbox.run_id is required".into())
+                })?;
+            let mut record = self.recovery.job(&action.job_id).ok_or_else(|| {
+                ConnectorError::Execution("create job has no recovery record".into())
+            })?;
+            if record.run_id != run_id {
+                return Err(ConnectorError::Malformed(
+                    "create_sandbox.run_id does not match the accepted job".into(),
+                ));
+            }
+            let sandbox_id = crate::domain::ids::sandbox_id_from_run(run_id);
+            record.sandbox_id = Some(sandbox_id.clone());
+            record.updated_at = Utc::now();
+            self.recovery
+                .save_job(record)
+                .map_err(ConnectorError::Execution)?;
+            local.sandbox_id = Some(sandbox_id);
+        }
         let result = match action.verb.as_str() {
             "create_sandbox" => match self.executor.execute(&local.job, local, &action).await {
                 Ok(value) => {
@@ -879,31 +918,41 @@ where
         };
         local.terminal = true;
         if terminal.instructions == "discard_local_copy" {
-            let mut cleanup_failed = false;
-            if let Err(error) = self.executor.destroy(&local).await {
-                warn!(job_id = %terminal.job_id, error = %error, "sandbox cleanup failed");
-                cleanup_failed = true;
-            }
-            if let Err(error) = tokio::fs::remove_dir_all(&local.workspace_path).await {
-                warn!(job_id = %terminal.job_id, error = %error, "workspace cleanup failed");
-                cleanup_failed = true;
-            }
-            if cleanup_failed {
-                if let Some(mut record) = self.recovery.job(&terminal.job_id) {
-                    record.terminal = true;
-                    record.cleanup_failed = true;
-                    record.updated_at = Utc::now();
-                    self.recovery
-                        .save_job(record)
-                        .map_err(ConnectorError::Execution)?;
-                }
-            } else {
+            // Journal cleanup intent before the HTTP call or file deletion. A
+            // restart must retry cleanup rather than restore terminal work.
+            let mut record = self.recovery.job(&terminal.job_id).ok_or_else(|| {
+                ConnectorError::Execution("terminal job has no recovery record".into())
+            })?;
+            record.terminal = true;
+            record.cleanup_failed = true;
+            record.updated_at = Utc::now();
+            self.recovery
+                .save_job(record)
+                .map_err(ConnectorError::Execution)?;
+            if self.cleanup_local_job(&local).await {
                 self.recovery
                     .remove_job(&terminal.job_id)
                     .map_err(ConnectorError::Execution)?;
             }
         }
         Ok(Vec::new())
+    }
+
+    async fn cleanup_local_job(&self, local: &LocalJob) -> bool {
+        let mut succeeded = true;
+        if let Err(error) = self.executor.destroy(local).await {
+            warn!(job_id = %local.job.job_id, error = %error, "sandbox cleanup failed; retaining recovery record");
+            succeeded = false;
+        }
+        if !local.workspace_path.as_os_str().is_empty() {
+            if let Err(error) = tokio::fs::remove_dir_all(&local.workspace_path).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(job_id = %local.job.job_id, error = %error, "workspace cleanup failed");
+                    succeeded = false;
+                }
+            }
+        }
+        succeeded
     }
 
     fn result_frame(
