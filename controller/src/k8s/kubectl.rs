@@ -703,7 +703,9 @@ fn parse_events_json(raw: &str) -> Vec<ObservedEvent> {
         .flatten()
         .map(|item| ObservedEvent {
             reason: json_string(item, "/reason").unwrap_or_default(),
-            message: json_string(item, "/message").unwrap_or_default(),
+            message: crate::observe::image_pull::safe_excerpt(
+                &json_string(item, "/message").unwrap_or_default(),
+            ),
             involved_kind: json_string(item, "/involvedObject/kind").unwrap_or_default(),
             involved_name: json_string(item, "/involvedObject/name").unwrap_or_default(),
             involved_uid: json_string(item, "/involvedObject/uid"),
@@ -769,7 +771,8 @@ fn parse_pods_json(raw: &str) -> Vec<ObservedPod> {
                         restart_count: c.get("restartCount").and_then(|v| v.as_i64()).unwrap_or(0)
                             as i32,
                         waiting_reason: json_string(c, "/state/waiting/reason"),
-                        waiting_message: json_string(c, "/state/waiting/message"),
+                        waiting_message: json_string(c, "/state/waiting/message")
+                            .map(|message| crate::observe::image_pull::safe_excerpt(&message)),
                         last_termination_reason: json_string(c, "/lastState/terminated/reason"),
                         image: spec_image,
                     });

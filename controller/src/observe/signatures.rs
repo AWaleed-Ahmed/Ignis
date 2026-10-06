@@ -109,32 +109,14 @@ pub fn analyze_observation(
         }
     }
 
+    if let Some(analyzed) = crate::observe::image_pull::analyze(obs) {
+        return to_signature(analyzed, true, evidence_from_obs(obs));
+    }
+
     // Live pod waiting reasons precede static hints
     for pod in &obs.pods {
         for c in &pod.container_statuses {
             if let Some(reason) = &c.waiting_reason {
-                if reason == "ImagePullBackOff" || reason == "ErrImagePull" {
-                    let mut attrs = serde_json::Map::new();
-                    if let Some(img) = &c.image {
-                        attrs.insert("image".into(), serde_json::Value::String(img.clone()));
-                    }
-                    return to_signature(
-                        AnalyzedSignature {
-                            class: "bad_image_reference".into(),
-                            key: format!("bad_image:{}:{}", pod.name, reason),
-                            reason: reason.clone(),
-                            message: c.waiting_message.clone(),
-                            resource_kind: "Pod".into(),
-                            resource_name: pod.name.clone(),
-                            container: Some(c.name.clone()),
-                            attributes: attrs,
-                            summary: Some("image pull failure".into()),
-                            confidence: 0.9,
-                        },
-                        true,
-                        evidence_from_obs(obs),
-                    );
-                }
                 if reason == "CreateContainerConfigError" {
                     return to_signature(
                         AnalyzedSignature {
@@ -265,15 +247,18 @@ fn to_signature(
 
 fn evidence_from_obs(obs: &WorkloadObservation) -> Vec<EvidenceRef> {
     let mut refs = Vec::new();
-    for (i, ev) in obs.events.iter().enumerate() {
+    for (i, ev) in obs.events.iter().take(8).enumerate() {
         refs.push(EvidenceRef {
             kind: "k8s_event".into(),
             id: format!("event-{i}"),
             path: None,
-            excerpt: Some(format!("{}: {}", ev.reason, ev.message)),
+            excerpt: Some(crate::observe::image_pull::safe_excerpt(&format!(
+                "{}: {}",
+                ev.reason, ev.message
+            ))),
         });
     }
-    for (i, pod) in obs.pods.iter().enumerate() {
+    for (i, pod) in obs.pods.iter().take(4).enumerate() {
         refs.push(EvidenceRef {
             kind: "pod_status".into(),
             id: format!("pod-{i}"),
