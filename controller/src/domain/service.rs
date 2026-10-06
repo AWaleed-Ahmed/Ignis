@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::time::{sleep, timeout, Instant};
@@ -23,6 +24,7 @@ pub struct SandboxService {
     backend: Arc<dyn ClusterBackend>,
     registry: Arc<SandboxRegistry>,
     recovery: Arc<RecoveryStore>,
+    operations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SandboxService {
@@ -31,6 +33,7 @@ impl SandboxService {
             backend,
             registry,
             recovery: Arc::new(RecoveryStore::in_memory()),
+            operations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -43,7 +46,22 @@ impl SandboxService {
             backend,
             registry,
             recovery,
+            operations: Mutex::new(HashMap::new()),
         }
+    }
+
+    async fn lock_sandbox(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, DomainError> {
+        let lock = self
+            .operations
+            .lock()
+            .map_err(|_| DomainError::Internal("sandbox operation lock poisoned".into()))?
+            .entry(sandbox_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        Ok(lock.lock_owned().await)
     }
 
     pub fn recovery(&self) -> Arc<RecoveryStore> {
@@ -186,6 +204,7 @@ impl SandboxService {
         }
         let deadline =
             crate::deadline::Deadline::new(Duration::from_secs(req.deploy_timeout_seconds as u64));
+        let _operation = self.lock_sandbox(sandbox_id).await?;
         let record = self.require_ready(sandbox_id)?;
         let workspace = resolve_workspace(
             req.workspace_path.as_deref(),
@@ -214,6 +233,23 @@ impl SandboxService {
             render::render_with_deadline(&effective_workspace, &req.manifests, deadline)?;
         policy::check_manifest_policy(&rendered.yaml)?;
 
+        deadline.remaining()?;
+        // Once apply starts the workload may change even if the command times out.
+        // Clear candidate-specific evidence before the first cluster mutation.
+        self.registry
+            .update(sandbox_id, |r| {
+                r.deployed_sha = None;
+                r.rendered_yaml = None;
+                r.resources.clear();
+                r.image_refs.clear();
+                r.last_fidelity = None;
+                r.last_patch = None;
+                r.last_signature = None;
+                r.after_signature = None;
+                r.last_validation = None;
+                r.finalized_result = None;
+            })
+            .map_err(DomainError::Internal)?;
         deadline.remaining()?;
         let apply = self
             .backend
@@ -312,6 +348,7 @@ impl SandboxService {
         sandbox_id: &str,
         req: ObserveFailureRequest,
     ) -> Result<ObserveFailureResponse, DomainError> {
+        let _operation = self.lock_sandbox(sandbox_id).await?;
         let record = self.require_ready(sandbox_id)?;
         if record.rendered_yaml.is_none() {
             return Err(DomainError::ObservationFailed(
@@ -406,7 +443,14 @@ impl SandboxService {
         sandbox_id: &str,
         req: RunValidationRequest,
     ) -> Result<ValidationResults, DomainError> {
+        let _operation = self.lock_sandbox(sandbox_id).await?;
         let record = self.require_ready(sandbox_id)?;
+
+        if record.deployed_sha.is_none() || record.rendered_yaml.is_none() {
+            return Err(DomainError::ValidationUnavailable(
+                "no completed deployment; workload state is unavailable or uncertain".into(),
+            ));
+        }
 
         // Refresh after signature for comparisons.
         let after = match self
@@ -463,6 +507,7 @@ impl SandboxService {
         sandbox_id: &str,
         req: FinalizeResultRequest,
     ) -> Result<FinalizeResultResponse, DomainError> {
+        let _operation = self.lock_sandbox(sandbox_id).await?;
         let record = self.require_ready(sandbox_id)?;
 
         if let Some(existing) = &record.finalized_result {
