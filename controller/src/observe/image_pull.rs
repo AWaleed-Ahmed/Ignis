@@ -97,7 +97,8 @@ pub fn analyze(obs: &WorkloadObservation) -> Option<AnalyzedSignature> {
                     }
                 }
             }
-            let cause = if c.waiting_message.is_some() && !c.message_complete {
+            let cause = if !c.image_current || (c.waiting_message.is_some() && !c.message_complete)
+            {
                 "unknown"
             } else {
                 cause(&messages.join("\n"))

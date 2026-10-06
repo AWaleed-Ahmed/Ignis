@@ -732,6 +732,19 @@ fn controller_owner(item: &serde_json::Value, kind: &str) -> Option<(String, Str
     ))
 }
 
+fn canonical_image(image: &str) -> String {
+    let Some((first, rest)) = image.split_once('/') else {
+        return format!("docker.io/library/{image}");
+    };
+    if first == "index.docker.io" || first == "registry-1.docker.io" {
+        format!("docker.io/{rest}")
+    } else if first.contains('.') || first.contains(':') || first == "localhost" {
+        image.to_string()
+    } else {
+        format!("docker.io/{image}")
+    }
+}
+
 fn parse_pods_json(raw: &str) -> Vec<ObservedPod> {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return vec![];
@@ -779,7 +792,14 @@ fn parse_pods_json(raw: &str) -> Vec<ObservedPod> {
                             .count()
                             == 1
                     });
+                    let image_current = spec_image
+                        .as_ref()
+                        .zip(json_string(c, "/image").as_ref())
+                        .is_some_and(|(spec, status)| {
+                            canonical_image(spec) == canonical_image(status)
+                        });
                     statuses.push(ObservedContainerStatus {
+                        image_current,
                         event_image_unique,
                         message_complete: json_string(c, "/state/waiting/message")
                             .is_some_and(|text| text.chars().count() <= 2048),
