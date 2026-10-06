@@ -766,7 +766,21 @@ fn parse_pods_json(raw: &str) -> Vec<ObservedPod> {
                             })
                         })
                         .and_then(|spec| json_string(spec, "/image"));
+                    let event_image_unique = spec_image.as_ref().is_some_and(|image| {
+                        ["/spec/containers", "/spec/initContainers"]
+                            .iter()
+                            .flat_map(|path| {
+                                item.pointer(path)
+                                    .and_then(|v| v.as_array())
+                                    .into_iter()
+                                    .flatten()
+                            })
+                            .filter(|spec| json_string(spec, "/image").as_ref() == Some(image))
+                            .count()
+                            == 1
+                    });
                     statuses.push(ObservedContainerStatus {
+                        event_image_unique,
                         message_complete: json_string(c, "/state/waiting/message")
                             .is_some_and(|text| text.chars().count() <= 2048),
                         name,

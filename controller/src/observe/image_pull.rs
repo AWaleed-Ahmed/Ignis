@@ -91,7 +91,7 @@ pub fn analyze(obs: &WorkloadObservation) -> Option<AnalyzedSignature> {
                         && event.involved_name == pod.name && event.observed_at.is_some_and(|time| time >= created && time >= chrono::Utc::now() - chrono::Duration::minutes(5))
                         && event.message.contains(&quoted_image)
                         // An image shared by two containers does not identify which failed.
-                        && pod.container_statuses.iter().filter(|other| other.image.as_ref() == Some(image)).count() == 1
+                        && c.event_image_unique
                     {
                         messages.push(event.message.as_str());
                     }

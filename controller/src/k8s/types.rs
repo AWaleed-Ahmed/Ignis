@@ -51,6 +51,7 @@ pub struct ObservedPod {
 
 #[derive(Debug, Clone, Default)]
 pub struct ObservedContainerStatus {
+    pub event_image_unique: bool,
     pub message_complete: bool,
     pub is_init: bool,
     pub name: String,
