@@ -6,6 +6,7 @@ pub mod api;
 pub mod artifacts;
 pub mod cleanup;
 pub mod connector;
+pub mod deadline;
 pub mod domain;
 pub mod fixtures;
 pub mod gitclone;

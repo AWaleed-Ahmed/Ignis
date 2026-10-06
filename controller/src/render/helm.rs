@@ -1,5 +1,6 @@
+use crate::deadline::Deadline;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::time::Duration;
 
 use tokio::runtime::Handle;
 
@@ -8,17 +9,30 @@ use crate::domain::models::ManifestSpec;
 use crate::render::RenderResult;
 
 pub fn render_helm(workspace: &str, manifests: &ManifestSpec) -> Result<RenderResult, DomainError> {
+    render_helm_with_deadline(
+        workspace,
+        manifests,
+        Deadline::new(Duration::from_secs(120)),
+    )
+}
+
+pub fn render_helm_with_deadline(
+    workspace: &str,
+    manifests: &ManifestSpec,
+    deadline: Deadline,
+) -> Result<RenderResult, DomainError> {
     // Prefer async runtime if present; helm template is sync CLI.
     if Handle::try_current().is_ok() {
         // We're on a runtime; use block_in_place for subprocess.
-        return tokio::task::block_in_place(|| render_helm_sync(workspace, manifests));
+        return tokio::task::block_in_place(|| render_helm_sync(workspace, manifests, deadline));
     }
-    render_helm_sync(workspace, manifests)
+    render_helm_sync(workspace, manifests, deadline)
 }
 
 fn render_helm_sync(
     workspace: &str,
     manifests: &ManifestSpec,
+    deadline: Deadline,
 ) -> Result<RenderResult, DomainError> {
     let chart = manifests
         .chart
@@ -58,10 +72,7 @@ fn render_helm_sync(
             lint_cmd.arg("-f").arg(&vp);
         }
     }
-    let lint = lint_cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+    let lint = crate::process::output(&mut lint_cmd, deadline.remaining()?);
 
     match lint {
         Ok(out) if !out.status.success() => {
@@ -79,6 +90,9 @@ fn render_helm_sync(
             }
         }
         Err(e) => {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                return Err(DomainError::Timeout("helm lint timed out".into()));
+            }
             // Fallback: if helm is not installed, try to render a simple charts/templates concat for demos
             if e.kind() == std::io::ErrorKind::NotFound {
                 if chart_path.join("values.schema.json").exists() {
@@ -93,18 +107,17 @@ fn render_helm_sync(
         _ => {}
     }
 
-    let output = std::process::Command::new("helm")
-        .args(&args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                DomainError::RenderFailed("helm binary not found".into())
-            } else {
-                DomainError::RenderFailed(e.to_string())
-            }
-        })?;
+    let output = crate::process::output(
+        std::process::Command::new("helm").args(&args),
+        deadline.remaining()?,
+    )
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::TimedOut {
+            DomainError::Timeout("helm template timed out".into())
+        } else {
+            DomainError::RenderFailed(e.to_string())
+        }
+    })?;
 
     if !output.status.success() {
         return Err(DomainError::RenderFailed(
