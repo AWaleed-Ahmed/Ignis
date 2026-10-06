@@ -225,6 +225,7 @@ impl ClusterBackend for MockCluster {
 
         if ns.healthy_override {
             return Ok(WorkloadObservation {
+                source: crate::k8s::ObservationSource::MockFixture,
                 events: vec![],
                 pods: vec![ObservedPod {
                     name: "demo-0".into(),
@@ -245,6 +246,7 @@ impl ClusterBackend for MockCluster {
 
         let synthetic = synthesize_from_yaml(&yaml);
         Ok(WorkloadObservation {
+            source: crate::k8s::ObservationSource::MockFixture,
             events: synthetic.events,
             pods: synthetic.pods,
             rendered_hint: Some(yaml),

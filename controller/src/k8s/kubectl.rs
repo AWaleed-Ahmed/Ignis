@@ -179,6 +179,7 @@ impl ClusterBackend for KubectlCluster {
         let pods = parse_pods_json(&pods_json);
 
         Ok(WorkloadObservation {
+            source: crate::k8s::ObservationSource::Runtime,
             events,
             pods,
             rendered_hint: None,

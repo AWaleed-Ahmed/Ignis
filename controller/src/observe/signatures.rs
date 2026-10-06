@@ -87,13 +87,29 @@ pub fn analyze_observation(
     obs: &WorkloadObservation,
     rendered_yaml: Option<&str>,
 ) -> FailureSignature {
-    if let Some(yaml) = rendered_yaml.or(obs.rendered_hint.as_deref()) {
-        if let Some(analyzed) = analyze_rendered_yaml(yaml) {
-            return to_signature(analyzed, true, evidence_from_obs(obs));
+    if obs.source == crate::k8s::ObservationSource::MockFixture {
+        if let Some(yaml) = rendered_yaml.or(obs.rendered_hint.as_deref()) {
+            if let Some(mut analyzed) = analyze_rendered_yaml(yaml) {
+                if analyzed.class == "bad_image_reference" {
+                    analyzed
+                        .attributes
+                        .insert("image_pull_cause".into(), "not_found".into());
+                    analyzed
+                        .attributes
+                        .insert("evidence_source".into(), "mock_fixture".into());
+                    analyzed
+                        .attributes
+                        .insert("owner_verified".into(), true.into());
+                    analyzed
+                        .attributes
+                        .insert("container_type".into(), "regular".into());
+                }
+                return to_signature(analyzed, true, evidence_from_obs(obs));
+            }
         }
     }
 
-    // Fall back to live pod waiting reasons
+    // Live pod waiting reasons precede static hints
     for pod in &obs.pods {
         for c in &pod.container_statuses {
             if let Some(reason) = &c.waiting_reason {
@@ -155,6 +171,14 @@ pub fn analyze_observation(
                     true,
                     evidence_from_obs(obs),
                 );
+            }
+        }
+    }
+
+    if let Some(yaml) = rendered_yaml {
+        if let Some(analyzed) = analyze_rendered_yaml(yaml) {
+            if !matches!(analyzed.class.as_str(), "bad_image_reference" | "healthy") {
+                return to_signature(analyzed, true, evidence_from_obs(obs));
             }
         }
     }

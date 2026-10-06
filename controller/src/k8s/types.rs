@@ -13,8 +13,15 @@ pub struct NamespaceSpec {
     pub memory_limit: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationSource {
+    Runtime,
+    MockFixture,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkloadObservation {
+    pub source: ObservationSource,
     pub events: Vec<ObservedEvent>,
     pub pods: Vec<ObservedPod>,
     pub rendered_hint: Option<String>,
