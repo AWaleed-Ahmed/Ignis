@@ -47,11 +47,15 @@ impl KubectlCluster {
     ) -> Result<(i32, String, String), DomainError> {
         let mut cmd = self.base_cmd();
         cmd.args(args);
-        let fut = cmd.output();
-        let output = timeout(max, fut)
+        let output = crate::process::output_async(&mut cmd, max)
             .await
-            .map_err(|_| DomainError::Timeout(format!("kubectl {} timed out", args.join(" "))))?
-            .map_err(|e| DomainError::ClusterUnavailable(e.to_string()))?;
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    DomainError::Timeout(format!("kubectl {} timed out", args.join(" ")))
+                } else {
+                    DomainError::ClusterUnavailable(e.to_string())
+                }
+            })?;
         let code = output.status.code().unwrap_or(1);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -104,7 +108,7 @@ impl ClusterBackend for KubectlCluster {
         }
 
         let isolation = isolation_manifest(spec);
-        apply_yaml(self, &spec.namespace, &isolation).await?;
+        apply_yaml(self, &spec.namespace, &isolation, Duration::from_secs(60)).await?;
         Ok(())
     }
 
@@ -144,11 +148,9 @@ impl ClusterBackend for KubectlCluster {
         } else {
             rendered_yaml.to_string()
         };
-        apply_yaml(self, namespace, &yaml).await?;
+        apply_yaml(self, namespace, &yaml, timeout_d).await?;
         let resources = list_resources_from_yaml(&yaml);
         let image_refs = crate::render::common::extract_images(&yaml);
-        // Best-effort wait
-        let _ = timeout_d;
         Ok(ApplyResult {
             resources,
             image_refs,
@@ -231,7 +233,7 @@ impl ClusterBackend for KubectlCluster {
         namespace: &str,
         secrets_yaml: &str,
     ) -> Result<(), DomainError> {
-        apply_yaml(self, namespace, secrets_yaml).await
+        apply_yaml(self, namespace, secrets_yaml, Duration::from_secs(60)).await
     }
 
     async fn collect_pod_logs(
@@ -555,15 +557,13 @@ async fn apply_yaml(
     cluster: &KubectlCluster,
     namespace: &str,
     yaml: &str,
+    budget: Duration,
 ) -> Result<(), DomainError> {
     let tmp = tempfile::NamedTempFile::new().map_err(|e| DomainError::Internal(e.to_string()))?;
     std::fs::write(tmp.path(), yaml).map_err(|e| DomainError::Internal(e.to_string()))?;
     let path = tmp.path().to_string_lossy().to_string();
     let (code, _, stderr) = cluster
-        .run(
-            &["apply", "-n", namespace, "-f", &path],
-            Duration::from_secs(60),
-        )
+        .run(&["apply", "-n", namespace, "-f", &path], budget)
         .await?;
     if code != 0 {
         return Err(DomainError::DeployFailed(stderr));

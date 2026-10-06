@@ -99,19 +99,16 @@ fn run_git(cwd: &Path, args: &[&str], timeout: Duration) -> Result<(), DomainErr
 fn run_git_output(
     cwd: &Path,
     args: &[&str],
-    _timeout: Duration,
+    timeout: Duration,
 ) -> Result<(i32, String, String), DomainError> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                DomainError::Internal("git binary not found; install git for clone-at-SHA".into())
-            } else {
-                DomainError::Internal(e.to_string())
-            }
-        })?;
+    let output = crate::process::output(Command::new("git").args(args).current_dir(cwd), timeout)
+        .map_err(|e| match e.kind() {
+        std::io::ErrorKind::TimedOut => DomainError::Timeout("git command timed out".into()),
+        std::io::ErrorKind::NotFound => {
+            DomainError::Internal("git binary not found; install git for clone-at-SHA".into())
+        }
+        _ => DomainError::Internal(e.to_string()),
+    })?;
     Ok((
         output.status.code().unwrap_or(1),
         String::from_utf8_lossy(&output.stdout).to_string(),
