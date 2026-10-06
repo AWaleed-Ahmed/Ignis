@@ -238,7 +238,9 @@ impl ClusterBackend for MockCluster {
                         waiting_message: None,
                         last_termination_reason: None,
                         image: Some("ghcr.io/raphael/demo:1.0.0".into()),
+                        ..Default::default()
                     }],
+                    ..Default::default()
                 }],
                 rendered_hint: Some(yaml),
             });
@@ -407,6 +409,7 @@ fn synthesize_from_yaml(yaml: &str) -> SyntheticObs {
                             .unwrap_or_else(|| "Readiness probe failed".into()),
                         involved_kind: sig.resource_kind.clone(),
                         involved_name: sig.resource_name.clone(),
+                        ..Default::default()
                     }],
                     pods: vec![ObservedPod {
                         name: format!("{}-0", sig.resource_name),
@@ -419,7 +422,9 @@ fn synthesize_from_yaml(yaml: &str) -> SyntheticObs {
                             waiting_message: None,
                             last_termination_reason: None,
                             image: Some("ghcr.io/raphael/demo:1.0.0".into()),
+                            ..Default::default()
                         }],
+                        ..Default::default()
                     }],
                 };
             }
@@ -430,6 +435,7 @@ fn synthesize_from_yaml(yaml: &str) -> SyntheticObs {
                         message: "Failed to pull image".into(),
                         involved_kind: "Pod".into(),
                         involved_name: sig.resource_name.clone(),
+                        ..Default::default()
                     }],
                     pods: vec![ObservedPod {
                         name: format!("{}-0", sig.resource_name),
@@ -446,7 +452,9 @@ fn synthesize_from_yaml(yaml: &str) -> SyntheticObs {
                                 .get("image")
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string()),
+                            ..Default::default()
                         }],
+                        ..Default::default()
                     }],
                 };
             }
@@ -457,6 +465,7 @@ fn synthesize_from_yaml(yaml: &str) -> SyntheticObs {
                         message: "Error: configmap key not found".into(),
                         involved_kind: "Pod".into(),
                         involved_name: sig.resource_name.clone(),
+                        ..Default::default()
                     }],
                     pods: vec![ObservedPod {
                         name: format!("{}-0", sig.resource_name),
@@ -469,7 +478,9 @@ fn synthesize_from_yaml(yaml: &str) -> SyntheticObs {
                             waiting_message: sig.message.clone(),
                             last_termination_reason: None,
                             image: Some("ghcr.io/raphael/demo:1.0.0".into()),
+                            ..Default::default()
                         }],
+                        ..Default::default()
                     }],
                 };
             }
@@ -480,6 +491,7 @@ fn synthesize_from_yaml(yaml: &str) -> SyntheticObs {
                         message: "service targetPort mismatch".into(),
                         involved_kind: "Service".into(),
                         involved_name: sig.resource_name.clone(),
+                        ..Default::default()
                     }],
                     pods: vec![ObservedPod {
                         name: "demo-0".into(),
@@ -492,7 +504,9 @@ fn synthesize_from_yaml(yaml: &str) -> SyntheticObs {
                             waiting_message: None,
                             last_termination_reason: None,
                             image: Some("ghcr.io/raphael/demo:1.0.0".into()),
+                            ..Default::default()
                         }],
+                        ..Default::default()
                     }],
                 };
             }
@@ -503,6 +517,7 @@ fn synthesize_from_yaml(yaml: &str) -> SyntheticObs {
                         message: "Container killed due to memory limit".into(),
                         involved_kind: "Pod".into(),
                         involved_name: sig.resource_name.clone(),
+                        ..Default::default()
                     }],
                     pods: vec![ObservedPod {
                         name: format!("{}-0", sig.resource_name),
@@ -515,7 +530,9 @@ fn synthesize_from_yaml(yaml: &str) -> SyntheticObs {
                             waiting_message: None,
                             last_termination_reason: Some("OOMKilled".into()),
                             image: Some("ghcr.io/raphael/demo:1.0.0".into()),
+                            ..Default::default()
                         }],
+                        ..Default::default()
                     }],
                 };
             }
@@ -536,7 +553,9 @@ fn synthesize_from_yaml(yaml: &str) -> SyntheticObs {
                 waiting_message: None,
                 last_termination_reason: None,
                 image: Some("ghcr.io/raphael/demo:1.0.0".into()),
+                ..Default::default()
             }],
+            ..Default::default()
         }],
     }
 }

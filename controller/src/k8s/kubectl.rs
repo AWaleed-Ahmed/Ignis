@@ -162,21 +162,54 @@ impl ClusterBackend for KubectlCluster {
         namespace: &str,
         max: Duration,
     ) -> Result<WorkloadObservation, DomainError> {
+        let deadline = crate::deadline::Deadline::new(max);
         let (code, stdout, stderr) = self
-            .run(&["get", "events", "-n", namespace, "-o", "json"], max)
+            .run(
+                &["get", "events", "-n", namespace, "-o", "json"],
+                deadline.remaining()?,
+            )
             .await?;
         if code != 0 {
             return Err(DomainError::ObservationFailed(stderr));
         }
         let events = parse_events_json(&stdout);
-
         let (code, pods_json, stderr) = self
-            .run(&["get", "pods", "-n", namespace, "-o", "json"], max)
+            .run(
+                &["get", "pods", "-n", namespace, "-o", "json"],
+                deadline.remaining()?,
+            )
             .await?;
         if code != 0 {
             return Err(DomainError::ObservationFailed(stderr));
         }
-        let pods = parse_pods_json(&pods_json);
+        let mut pods = parse_pods_json(&pods_json);
+        if pods.iter().any(|pod| {
+            pod.container_statuses.iter().any(|c| {
+                matches!(
+                    c.waiting_reason.as_deref(),
+                    Some("ImagePullBackOff" | "ErrImagePull")
+                )
+            })
+        }) {
+            if let Ok(remaining) = deadline.cap(Duration::from_secs(5)) {
+                if let Ok((0, owners, _)) = self
+                    .run(
+                        &[
+                            "get",
+                            "replicasets,deployments",
+                            "-n",
+                            namespace,
+                            "-o",
+                            "json",
+                        ],
+                        remaining,
+                    )
+                    .await
+                {
+                    resolve_deployment_owners(&mut pods, &owners, namespace);
+                }
+            }
+        }
 
         Ok(WorkloadObservation {
             source: crate::k8s::ObservationSource::Runtime,
@@ -645,109 +678,145 @@ fn list_resources_from_yaml(yaml: &str) -> Vec<ResourceRef> {
     crate::render::common::list_resources(yaml)
 }
 
+fn json_string(value: &serde_json::Value, path: &str) -> Option<String> {
+    value
+        .pointer(path)?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn json_time(value: &serde_json::Value, path: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(&json_string(value, path)?)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
 fn parse_events_json(raw: &str) -> Vec<ObservedEvent> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return vec![];
     };
-    v.get("items")
-        .and_then(|i| i.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .map(|item| ObservedEvent {
-                    reason: item
-                        .get("reason")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    message: item
-                        .get("message")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    involved_kind: item
-                        .pointer("/involvedObject/kind")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    involved_name: item
-                        .pointer("/involvedObject/name")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                })
-                .collect()
+    value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .map(|item| ObservedEvent {
+            reason: json_string(item, "/reason").unwrap_or_default(),
+            message: json_string(item, "/message").unwrap_or_default(),
+            involved_kind: json_string(item, "/involvedObject/kind").unwrap_or_default(),
+            involved_name: json_string(item, "/involvedObject/name").unwrap_or_default(),
+            involved_uid: json_string(item, "/involvedObject/uid"),
+            observed_at: json_time(item, "/eventTime")
+                .or_else(|| json_time(item, "/lastTimestamp")),
         })
-        .unwrap_or_default()
+        .collect()
+}
+
+fn controller_owner(item: &serde_json::Value, kind: &str) -> Option<(String, String)> {
+    let owners = item.pointer("/metadata/ownerReferences")?.as_array()?;
+    let controlling: Vec<_> = owners
+        .iter()
+        .filter(|owner| owner.get("controller").and_then(|v| v.as_bool()) == Some(true))
+        .collect();
+    if controlling.len() != 1 || controlling[0].get("kind")?.as_str()? != kind {
+        return None;
+    }
+    Some((
+        json_string(controlling[0], "/name")?,
+        json_string(controlling[0], "/uid")?,
+    ))
 }
 
 fn parse_pods_json(raw: &str) -> Vec<ObservedPod> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return vec![];
     };
-    v.get("items")
-        .and_then(|i| i.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .map(|item| {
-                    let name = item
-                        .pointer("/metadata/name")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("pod")
-                        .to_string();
-                    let phase = item
-                        .pointer("/status/phase")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("Unknown")
-                        .to_string();
-                    let container_statuses = item
-                        .pointer("/status/containerStatuses")
-                        .and_then(|x| x.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .map(|c| ObservedContainerStatus {
-                                    name: c
-                                        .get("name")
-                                        .and_then(|x| x.as_str())
-                                        .unwrap_or("app")
-                                        .to_string(),
-                                    ready: c
-                                        .get("ready")
-                                        .and_then(|x| x.as_bool())
-                                        .unwrap_or(false),
-                                    restart_count: c
-                                        .get("restartCount")
-                                        .and_then(|x| x.as_i64())
-                                        .unwrap_or(0)
-                                        as i32,
-                                    waiting_reason: c
-                                        .pointer("/state/waiting/reason")
-                                        .and_then(|x| x.as_str())
-                                        .map(|s| s.to_string()),
-                                    waiting_message: c
-                                        .pointer("/state/waiting/message")
-                                        .and_then(|x| x.as_str())
-                                        .map(|s| s.to_string()),
-                                    last_termination_reason: c
-                                        .pointer("/lastState/terminated/reason")
-                                        .and_then(|x| x.as_str())
-                                        .map(|s| s.to_string()),
-                                    image: c
-                                        .get("image")
-                                        .and_then(|x| x.as_str())
-                                        .map(|s| s.to_string()),
-                                })
-                                .collect()
+    value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .map(|item| {
+            let mut statuses = Vec::new();
+            for (spec_path, status_path, is_init) in [
+                ("/spec/containers", "/status/containerStatuses", false),
+                (
+                    "/spec/initContainers",
+                    "/status/initContainerStatuses",
+                    true,
+                ),
+            ] {
+                let specs = item.pointer(spec_path).and_then(|v| v.as_array());
+                for c in item
+                    .pointer(status_path)
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    let name = json_string(c, "/name").unwrap_or_default();
+                    let spec_image = specs
+                        .and_then(|items| {
+                            items.iter().find(|spec| {
+                                spec.get("name").and_then(|v| v.as_str()) == Some(name.as_str())
+                            })
                         })
-                        .unwrap_or_default();
-                    ObservedPod {
+                        .and_then(|spec| json_string(spec, "/image"));
+                    statuses.push(ObservedContainerStatus {
                         name,
-                        phase,
-                        container_statuses,
-                    }
-                })
-                .collect()
+                        is_init,
+                        ready: c.get("ready").and_then(|v| v.as_bool()).unwrap_or(false),
+                        restart_count: c.get("restartCount").and_then(|v| v.as_i64()).unwrap_or(0)
+                            as i32,
+                        waiting_reason: json_string(c, "/state/waiting/reason"),
+                        waiting_message: json_string(c, "/state/waiting/message"),
+                        last_termination_reason: json_string(c, "/lastState/terminated/reason"),
+                        image: spec_image,
+                    });
+                }
+            }
+            ObservedPod {
+                name: json_string(item, "/metadata/name").unwrap_or_default(),
+                uid: json_string(item, "/metadata/uid"),
+                created_at: json_time(item, "/metadata/creationTimestamp"),
+                replica_set: controller_owner(item, "ReplicaSet"),
+                deployment: None,
+                phase: json_string(item, "/status/phase").unwrap_or_else(|| "Unknown".into()),
+                container_statuses: statuses,
+            }
         })
-        .unwrap_or_default()
+        .collect()
+}
+
+fn resolve_deployment_owners(pods: &mut [ObservedPod], raw: &str, namespace: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    let Some(items) = value.get("items").and_then(|v| v.as_array()) else {
+        return;
+    };
+    for pod in pods {
+        let Some((rs_name, rs_uid)) = &pod.replica_set else {
+            continue;
+        };
+        let Some(rs) = items.iter().find(|item| {
+            item.get("kind").and_then(|v| v.as_str()) == Some("ReplicaSet")
+                && json_string(item, "/metadata/name").as_ref() == Some(rs_name)
+                && json_string(item, "/metadata/uid").as_ref() == Some(rs_uid)
+                && json_string(item, "/metadata/namespace").as_deref() == Some(namespace)
+        }) else {
+            continue;
+        };
+        let Some((dep_name, dep_uid)) = controller_owner(rs, "Deployment") else {
+            continue;
+        };
+        if items.iter().any(|item| {
+            item.get("kind").and_then(|v| v.as_str()) == Some("Deployment")
+                && json_string(item, "/metadata/name").as_deref() == Some(dep_name.as_str())
+                && json_string(item, "/metadata/uid").as_deref() == Some(dep_uid.as_str())
+                && json_string(item, "/metadata/namespace").as_deref() == Some(namespace)
+        }) {
+            pod.deployment = Some(dep_name);
+        }
+    }
 }
