@@ -1131,6 +1131,7 @@ fn validate_action_args(verb: &str, args: &Value) -> Result<(), ConnectorError> 
                     "manifests",
                     "patch",
                     "wait_seconds",
+                    "deploy_timeout_seconds",
                 ],
                 verb,
             )?;

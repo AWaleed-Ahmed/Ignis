@@ -8,6 +8,18 @@ use crate::domain::errors::DomainError;
 
 /// Clone `clone_url` and check out `commit_sha` into a fresh temp directory.
 pub fn clone_at_sha(clone_url: &str, commit_sha: &str) -> Result<PathBuf, DomainError> {
+    clone_at_sha_with_deadline(
+        clone_url,
+        commit_sha,
+        crate::deadline::Deadline::new(Duration::from_secs(180)),
+    )
+}
+
+pub fn clone_at_sha_with_deadline(
+    clone_url: &str,
+    commit_sha: &str,
+    deadline: crate::deadline::Deadline,
+) -> Result<PathBuf, DomainError> {
     if clone_url.trim().is_empty() {
         return Err(DomainError::InvalidRequest("clone_url is empty".into()));
     }
@@ -21,22 +33,28 @@ pub fn clone_at_sha(clone_url: &str, commit_sha: &str) -> Result<PathBuf, Domain
         .prefix("raphael-clone-")
         .tempdir()
         .map_err(|e| DomainError::Internal(e.to_string()))?;
-    let workspace = kept.keep();
+    let workspace = kept.path().to_path_buf();
 
-    run_git(&workspace, &["init"], Duration::from_secs(30))?;
+    run_git(
+        &workspace,
+        &["init"],
+        deadline.cap(Duration::from_secs(30))?,
+    )?;
     run_git(
         &workspace,
         &["remote", "add", "origin", clone_url],
-        Duration::from_secs(30),
+        deadline.cap(Duration::from_secs(30))?,
     )?;
 
-    if run_git(
+    let fetch = run_git(
         &workspace,
         &["fetch", "--depth", "1", "origin", commit_sha],
-        Duration::from_secs(120),
-    )
-    .is_err()
-    {
+        deadline.cap(Duration::from_secs(120))?,
+    );
+    if matches!(fetch, Err(DomainError::Timeout(_))) {
+        return fetch.map(|_| workspace);
+    }
+    if fetch.is_err() {
         let _ = std::fs::remove_dir_all(&workspace);
         std::fs::create_dir_all(&workspace).map_err(|e| DomainError::Internal(e.to_string()))?;
         run_git(
@@ -48,23 +66,26 @@ pub fn clone_at_sha(clone_url: &str, commit_sha: &str) -> Result<PathBuf, Domain
                 clone_url,
                 workspace.to_str().unwrap_or("."),
             ],
-            Duration::from_secs(180),
+            deadline.cap(Duration::from_secs(180))?,
         )?;
         run_git(
             &workspace,
             &["fetch", "origin", commit_sha],
-            Duration::from_secs(120),
+            deadline.cap(Duration::from_secs(120))?,
         )?;
     }
 
     run_git(
         &workspace,
         &["checkout", "--force", commit_sha],
-        Duration::from_secs(60),
+        deadline.cap(Duration::from_secs(60))?,
     )?;
 
-    let (code, stdout, stderr) =
-        run_git_output(&workspace, &["rev-parse", "HEAD"], Duration::from_secs(15))?;
+    let (code, stdout, stderr) = run_git_output(
+        &workspace,
+        &["rev-parse", "HEAD"],
+        deadline.cap(Duration::from_secs(15))?,
+    )?;
     if code != 0 {
         return Err(DomainError::Internal(format!(
             "git rev-parse failed: {stderr}"
@@ -82,7 +103,8 @@ pub fn clone_at_sha(clone_url: &str, commit_sha: &str) -> Result<PathBuf, Domain
     }
 
     tracing::info!(%clone_url, %commit_sha, path = %workspace.display(), "cloned repository at SHA");
-    Ok(workspace)
+    deadline.remaining()?;
+    Ok(kept.keep())
 }
 
 fn run_git(cwd: &Path, args: &[&str], timeout: Duration) -> Result<(), DomainError> {
