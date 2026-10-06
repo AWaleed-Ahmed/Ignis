@@ -84,12 +84,21 @@ pub struct DeployRevisionRequest {
     pub patch: Option<PatchSpec>,
     #[serde(default = "default_wait_seconds")]
     pub wait_seconds: u32,
-    #[serde(default = "default_deploy_timeout_seconds")]
+    // Keep the legacy serialized request (and receipt hash) for the default
+    // budget. Non-default budgets remain part of the replay identity.
+    #[serde(
+        default = "default_deploy_timeout_seconds",
+        skip_serializing_if = "is_default_deploy_timeout_seconds"
+    )]
     pub deploy_timeout_seconds: u32,
 }
 
 pub fn default_deploy_timeout_seconds() -> u32 {
     120
+}
+
+fn is_default_deploy_timeout_seconds(value: &u32) -> bool {
+    *value == default_deploy_timeout_seconds()
 }
 
 fn default_wait_seconds() -> u32 {
