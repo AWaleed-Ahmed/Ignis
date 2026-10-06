@@ -56,3 +56,18 @@ No tests were added or executed. Test compilation is not a test pass. No kind/re
 
 Before readiness: add/run the planned deterministic and owned registry/kind controls when requested, refresh legacy image fixtures for the new explicit evidence requirements, run paired regressions and document exact candidate SHAs. Existing legacy automatic image-repair fixtures are intentionally no longer accepted without verified evidence. Coordinate consumer rollout and finish #17 lease/progress work separately.
 
+
+## Follow-up review fixes and PR qualification
+
+The user requested fixes and a GitHub PR with CI verification. Three findings are addressed:
+
+- `ca649dc`: preserve status/spec image identity; mismatched or missing status image makes the pull cause unknown. Normalize explicit Docker Hub expansion only; do not equate different tags/digests.
+- `10edf6b`: one observation deadline starts before sandbox-lock acquisition and passes through Kubernetes queries and optional logs. Skip logs after exhaustion. Subprocesses use remaining time, with Unicode-safe byte truncation for log output. Synchronous filesystem/report work remains cooperative, as documented in #17.
+- Paired Raphael `0c99428`: select verified structured image diagnoses directly, without requiring matching log text.
+- `b71e781`: four Rust regression tests cover stale image identity, Docker Hub expansion, cause/conflict cases and truncated evidence. The older terminal-cleanup fixture now accepts jobs through the real recovery journal path.
+
+Final local command: `CARGO_TARGET_DIR=/tmp/ignis-deploy-deadline/controller/target cargo test --manifest-path controller/Cargo.toml --locked --offline`: **66 passed** (loopback HTTP fixtures required unsandboxed execution). Earlier sandboxed runs failed eight socket binds; the initial unsandboxed run exposed one journal-bypassing fixture, now corrected. No failures were suppressed.
+
+Paired Raphael local checks: **396 agent tests passed, 4 skipped; 77 dispatch tests passed**. These are mocked/parser/service checks, not live registry or kind proof. The existing cross-repository jobs will test the exact Ignis implementation SHA `b71e781b7f93246f271bb15df8efa2c0fda8e662` for this paired PR. Contract snapshots remain at the published release; callers do not yet send the new #17 budget field.
+
+Merge-tree comparison against fetched main is conflict-free. The Ignis PR necessarily includes the reviewed but incomplete #17 prerequisite commits, since this branch descends from them. Heartbeat/lease coordination, complete platform cancellation qualification and contract release remain outstanding. Open as draft for review; do not merge or close issues automatically. Hosted CI status will be reported separately from these local results.
