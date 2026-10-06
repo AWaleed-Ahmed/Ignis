@@ -13,30 +13,48 @@ pub struct NamespaceSpec {
     pub memory_limit: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationSource {
+    Runtime,
+    MockFixture,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkloadObservation {
+    pub source: ObservationSource,
     pub events: Vec<ObservedEvent>,
     pub pods: Vec<ObservedPod>,
     pub rendered_hint: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ObservedEvent {
+    pub message_complete: bool,
+    pub involved_uid: Option<String>,
+    pub observed_at: Option<DateTime<Utc>>,
     pub reason: String,
     pub message: String,
     pub involved_kind: String,
     pub involved_name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ObservedPod {
+    pub uid: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
+    pub replica_set: Option<(String, String)>,
+    pub deployment: Option<String>,
     pub name: String,
     pub phase: String,
     pub container_statuses: Vec<ObservedContainerStatus>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ObservedContainerStatus {
+    pub image_current: bool,
+    pub event_image_unique: bool,
+    pub message_complete: bool,
+    pub is_init: bool,
     pub name: String,
     pub ready: bool,
     pub restart_count: i32,

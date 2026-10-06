@@ -73,6 +73,7 @@ pub trait ClusterBackend: Send + Sync {
         &self,
         namespace: &str,
         max_bytes_per_pod: usize,
+        budget: Duration,
     ) -> Result<Vec<LogArtifact>, DomainError>;
 
     /// Best-effort resolve running container image digests (imageID) in the namespace.

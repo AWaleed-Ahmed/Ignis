@@ -1,5 +1,6 @@
+use crate::deadline::Deadline;
 use std::path::PathBuf;
-use std::process::Stdio;
+use std::time::Duration;
 
 use crate::domain::errors::DomainError;
 use crate::domain::models::ManifestSpec;
@@ -8,6 +9,18 @@ use crate::render::RenderResult;
 pub fn render_kustomize(
     workspace: &str,
     manifests: &ManifestSpec,
+) -> Result<RenderResult, DomainError> {
+    render_kustomize_with_deadline(
+        workspace,
+        manifests,
+        Deadline::new(Duration::from_secs(120)),
+    )
+}
+
+pub fn render_kustomize_with_deadline(
+    workspace: &str,
+    manifests: &ManifestSpec,
+    deadline: Deadline,
 ) -> Result<RenderResult, DomainError> {
     let overlay = manifests
         .overlay
@@ -25,11 +38,10 @@ pub fn render_kustomize(
     }
 
     // Prefer kubectl kustomize; fall back to reading resources listed in kustomization if tools missing.
-    let output = std::process::Command::new("kubectl")
-        .args(["kustomize", &root.to_string_lossy()])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output();
+    let output = crate::process::output(
+        std::process::Command::new("kubectl").args(["kustomize", &root.to_string_lossy()]),
+        deadline.remaining()?,
+    );
 
     match output {
         Ok(out) if out.status.success() => {
@@ -42,11 +54,15 @@ pub fn render_kustomize(
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
             // try kustomize binary
-            let alt = std::process::Command::new("kustomize")
-                .args(["build", &root.to_string_lossy()])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output();
+            let alt = crate::process::output(
+                std::process::Command::new("kustomize").args(["build", &root.to_string_lossy()]),
+                deadline.remaining()?,
+            );
+            if let Err(error) = &alt {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    return Err(DomainError::Timeout("kustomize build timed out".into()));
+                }
+            }
             if let Ok(out2) = alt {
                 if out2.status.success() {
                     return Ok(RenderResult {
@@ -72,6 +88,9 @@ pub fn render_kustomize(
                 render_path: format!("kustomize-fallback:{overlay}"),
                 files: Vec::new(),
             })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(DomainError::Timeout("kubectl kustomize timed out".into()))
         }
         Err(e) => Err(DomainError::RenderFailed(e.to_string())),
     }

@@ -47,11 +47,15 @@ impl KubectlCluster {
     ) -> Result<(i32, String, String), DomainError> {
         let mut cmd = self.base_cmd();
         cmd.args(args);
-        let fut = cmd.output();
-        let output = timeout(max, fut)
+        let output = crate::process::output_async(&mut cmd, max)
             .await
-            .map_err(|_| DomainError::Timeout(format!("kubectl {} timed out", args.join(" "))))?
-            .map_err(|e| DomainError::ClusterUnavailable(e.to_string()))?;
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::TimedOut {
+                    DomainError::Timeout(format!("kubectl {} timed out", args.join(" ")))
+                } else {
+                    DomainError::ClusterUnavailable(e.to_string())
+                }
+            })?;
         let code = output.status.code().unwrap_or(1);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -104,7 +108,7 @@ impl ClusterBackend for KubectlCluster {
         }
 
         let isolation = isolation_manifest(spec);
-        apply_yaml(self, &spec.namespace, &isolation).await?;
+        apply_yaml(self, &spec.namespace, &isolation, Duration::from_secs(60)).await?;
         Ok(())
     }
 
@@ -144,11 +148,9 @@ impl ClusterBackend for KubectlCluster {
         } else {
             rendered_yaml.to_string()
         };
-        apply_yaml(self, namespace, &yaml).await?;
+        apply_yaml(self, namespace, &yaml, timeout_d).await?;
         let resources = list_resources_from_yaml(&yaml);
         let image_refs = crate::render::common::extract_images(&yaml);
-        // Best-effort wait
-        let _ = timeout_d;
         Ok(ApplyResult {
             resources,
             image_refs,
@@ -160,23 +162,57 @@ impl ClusterBackend for KubectlCluster {
         namespace: &str,
         max: Duration,
     ) -> Result<WorkloadObservation, DomainError> {
+        let deadline = crate::deadline::Deadline::new(max);
         let (code, stdout, stderr) = self
-            .run(&["get", "events", "-n", namespace, "-o", "json"], max)
+            .run(
+                &["get", "events", "-n", namespace, "-o", "json"],
+                deadline.remaining()?,
+            )
             .await?;
         if code != 0 {
             return Err(DomainError::ObservationFailed(stderr));
         }
         let events = parse_events_json(&stdout);
-
         let (code, pods_json, stderr) = self
-            .run(&["get", "pods", "-n", namespace, "-o", "json"], max)
+            .run(
+                &["get", "pods", "-n", namespace, "-o", "json"],
+                deadline.remaining()?,
+            )
             .await?;
         if code != 0 {
             return Err(DomainError::ObservationFailed(stderr));
         }
-        let pods = parse_pods_json(&pods_json);
+        let mut pods = parse_pods_json(&pods_json);
+        if pods.iter().any(|pod| {
+            pod.container_statuses.iter().any(|c| {
+                matches!(
+                    c.waiting_reason.as_deref(),
+                    Some("ImagePullBackOff" | "ErrImagePull")
+                )
+            })
+        }) {
+            if let Ok(remaining) = deadline.cap(Duration::from_secs(5)) {
+                if let Ok((0, owners, _)) = self
+                    .run(
+                        &[
+                            "get",
+                            "replicasets,deployments",
+                            "-n",
+                            namespace,
+                            "-o",
+                            "json",
+                        ],
+                        remaining,
+                    )
+                    .await
+                {
+                    resolve_deployment_owners(&mut pods, &owners, namespace);
+                }
+            }
+        }
 
         Ok(WorkloadObservation {
+            source: crate::k8s::ObservationSource::Runtime,
             events,
             pods,
             rendered_hint: None,
@@ -231,18 +267,20 @@ impl ClusterBackend for KubectlCluster {
         namespace: &str,
         secrets_yaml: &str,
     ) -> Result<(), DomainError> {
-        apply_yaml(self, namespace, secrets_yaml).await
+        apply_yaml(self, namespace, secrets_yaml, Duration::from_secs(60)).await
     }
 
     async fn collect_pod_logs(
         &self,
         namespace: &str,
         max_bytes_per_pod: usize,
+        budget: Duration,
     ) -> Result<Vec<LogArtifact>, DomainError> {
+        let deadline = crate::deadline::Deadline::new(budget);
         let (code, pods_json, stderr) = self
             .run(
                 &["get", "pods", "-n", namespace, "-o", "json"],
-                Duration::from_secs(30),
+                deadline.cap(Duration::from_secs(30))?,
             )
             .await?;
         if code != 0 {
@@ -251,6 +289,9 @@ impl ClusterBackend for KubectlCluster {
         let pods = parse_pods_json(&pods_json);
         let mut out = Vec::new();
         for pod in pods {
+            if deadline.remaining().is_err() {
+                break;
+            }
             let container = pod
                 .container_statuses
                 .first()
@@ -268,7 +309,7 @@ impl ClusterBackend for KubectlCluster {
                         "--tail=200",
                         "--timestamps=true",
                     ],
-                    Duration::from_secs(30),
+                    deadline.cap(Duration::from_secs(30))?,
                 )
                 .await?;
             let mut content = if code == 0 {
@@ -277,7 +318,11 @@ impl ClusterBackend for KubectlCluster {
                 format!("log_unavailable: {stderr}")
             };
             if content.len() > max_bytes_per_pod {
-                content.truncate(max_bytes_per_pod);
+                let mut end = max_bytes_per_pod;
+                while !content.is_char_boundary(end) {
+                    end -= 1;
+                }
+                content.truncate(end);
             }
             out.push(LogArtifact {
                 pod: pod.name,
@@ -555,15 +600,13 @@ async fn apply_yaml(
     cluster: &KubectlCluster,
     namespace: &str,
     yaml: &str,
+    budget: Duration,
 ) -> Result<(), DomainError> {
     let tmp = tempfile::NamedTempFile::new().map_err(|e| DomainError::Internal(e.to_string()))?;
     std::fs::write(tmp.path(), yaml).map_err(|e| DomainError::Internal(e.to_string()))?;
     let path = tmp.path().to_string_lossy().to_string();
     let (code, _, stderr) = cluster
-        .run(
-            &["apply", "-n", namespace, "-f", &path],
-            Duration::from_secs(60),
-        )
+        .run(&["apply", "-n", namespace, "-f", &path], budget)
         .await?;
     if code != 0 {
         return Err(DomainError::DeployFailed(stderr));
@@ -644,109 +687,285 @@ fn list_resources_from_yaml(yaml: &str) -> Vec<ResourceRef> {
     crate::render::common::list_resources(yaml)
 }
 
+fn json_string(value: &serde_json::Value, path: &str) -> Option<String> {
+    value
+        .pointer(path)?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn json_time(value: &serde_json::Value, path: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(&json_string(value, path)?)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
 fn parse_events_json(raw: &str) -> Vec<ObservedEvent> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return vec![];
     };
-    v.get("items")
-        .and_then(|i| i.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .map(|item| ObservedEvent {
-                    reason: item
-                        .get("reason")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    message: item
-                        .get("message")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    involved_kind: item
-                        .pointer("/involvedObject/kind")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    involved_name: item
-                        .pointer("/involvedObject/name")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                })
-                .collect()
+    value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .map(|item| ObservedEvent {
+            message_complete: json_string(item, "/message")
+                .is_some_and(|text| text.chars().count() <= 2048),
+            reason: json_string(item, "/reason").unwrap_or_default(),
+            message: crate::observe::image_pull::safe_excerpt(
+                &json_string(item, "/message").unwrap_or_default(),
+            ),
+            involved_kind: json_string(item, "/involvedObject/kind").unwrap_or_default(),
+            involved_name: json_string(item, "/involvedObject/name").unwrap_or_default(),
+            involved_uid: json_string(item, "/involvedObject/uid"),
+            observed_at: json_time(item, "/eventTime")
+                .or_else(|| json_time(item, "/lastTimestamp")),
         })
-        .unwrap_or_default()
+        .collect()
+}
+
+fn controller_owner(item: &serde_json::Value, kind: &str) -> Option<(String, String)> {
+    let owners = item.pointer("/metadata/ownerReferences")?.as_array()?;
+    let controlling: Vec<_> = owners
+        .iter()
+        .filter(|owner| owner.get("controller").and_then(|v| v.as_bool()) == Some(true))
+        .collect();
+    if controlling.len() != 1 || controlling[0].get("kind")?.as_str()? != kind {
+        return None;
+    }
+    Some((
+        json_string(controlling[0], "/name")?,
+        json_string(controlling[0], "/uid")?,
+    ))
+}
+
+fn canonical_image(image: &str) -> String {
+    let Some((first, rest)) = image.split_once('/') else {
+        return format!("docker.io/library/{image}");
+    };
+    if first == "index.docker.io" || first == "registry-1.docker.io" {
+        format!("docker.io/{rest}")
+    } else if first.contains('.') || first.contains(':') || first == "localhost" {
+        image.to_string()
+    } else {
+        format!("docker.io/{image}")
+    }
 }
 
 fn parse_pods_json(raw: &str) -> Vec<ObservedPod> {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return vec![];
     };
-    v.get("items")
-        .and_then(|i| i.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .map(|item| {
-                    let name = item
-                        .pointer("/metadata/name")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("pod")
-                        .to_string();
-                    let phase = item
-                        .pointer("/status/phase")
-                        .and_then(|x| x.as_str())
-                        .unwrap_or("Unknown")
-                        .to_string();
-                    let container_statuses = item
-                        .pointer("/status/containerStatuses")
-                        .and_then(|x| x.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .map(|c| ObservedContainerStatus {
-                                    name: c
-                                        .get("name")
-                                        .and_then(|x| x.as_str())
-                                        .unwrap_or("app")
-                                        .to_string(),
-                                    ready: c
-                                        .get("ready")
-                                        .and_then(|x| x.as_bool())
-                                        .unwrap_or(false),
-                                    restart_count: c
-                                        .get("restartCount")
-                                        .and_then(|x| x.as_i64())
-                                        .unwrap_or(0)
-                                        as i32,
-                                    waiting_reason: c
-                                        .pointer("/state/waiting/reason")
-                                        .and_then(|x| x.as_str())
-                                        .map(|s| s.to_string()),
-                                    waiting_message: c
-                                        .pointer("/state/waiting/message")
-                                        .and_then(|x| x.as_str())
-                                        .map(|s| s.to_string()),
-                                    last_termination_reason: c
-                                        .pointer("/lastState/terminated/reason")
-                                        .and_then(|x| x.as_str())
-                                        .map(|s| s.to_string()),
-                                    image: c
-                                        .get("image")
-                                        .and_then(|x| x.as_str())
-                                        .map(|s| s.to_string()),
-                                })
-                                .collect()
+    value
+        .get("items")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .map(|item| {
+            let mut statuses = Vec::new();
+            for (spec_path, status_path, is_init) in [
+                ("/spec/containers", "/status/containerStatuses", false),
+                (
+                    "/spec/initContainers",
+                    "/status/initContainerStatuses",
+                    true,
+                ),
+            ] {
+                let specs = item.pointer(spec_path).and_then(|v| v.as_array());
+                for c in item
+                    .pointer(status_path)
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    let name = json_string(c, "/name").unwrap_or_default();
+                    let spec_image = specs
+                        .and_then(|items| {
+                            items.iter().find(|spec| {
+                                spec.get("name").and_then(|v| v.as_str()) == Some(name.as_str())
+                            })
                         })
-                        .unwrap_or_default();
-                    ObservedPod {
+                        .and_then(|spec| json_string(spec, "/image"));
+                    let event_image_unique = spec_image.as_ref().is_some_and(|image| {
+                        ["/spec/containers", "/spec/initContainers"]
+                            .iter()
+                            .flat_map(|path| {
+                                item.pointer(path)
+                                    .and_then(|v| v.as_array())
+                                    .into_iter()
+                                    .flatten()
+                            })
+                            .filter(|spec| json_string(spec, "/image").as_ref() == Some(image))
+                            .count()
+                            == 1
+                    });
+                    let image_current = spec_image
+                        .as_ref()
+                        .zip(json_string(c, "/image").as_ref())
+                        .is_some_and(|(spec, status)| {
+                            canonical_image(spec) == canonical_image(status)
+                        });
+                    statuses.push(ObservedContainerStatus {
+                        image_current,
+                        event_image_unique,
+                        message_complete: json_string(c, "/state/waiting/message")
+                            .is_some_and(|text| text.chars().count() <= 2048),
                         name,
-                        phase,
-                        container_statuses,
-                    }
-                })
-                .collect()
+                        is_init,
+                        ready: c.get("ready").and_then(|v| v.as_bool()).unwrap_or(false),
+                        restart_count: c.get("restartCount").and_then(|v| v.as_i64()).unwrap_or(0)
+                            as i32,
+                        waiting_reason: json_string(c, "/state/waiting/reason"),
+                        waiting_message: json_string(c, "/state/waiting/message")
+                            .map(|message| crate::observe::image_pull::safe_excerpt(&message)),
+                        last_termination_reason: json_string(c, "/lastState/terminated/reason"),
+                        image: spec_image,
+                    });
+                }
+            }
+            ObservedPod {
+                name: json_string(item, "/metadata/name").unwrap_or_default(),
+                uid: json_string(item, "/metadata/uid"),
+                created_at: json_time(item, "/metadata/creationTimestamp"),
+                replica_set: controller_owner(item, "ReplicaSet"),
+                deployment: None,
+                phase: json_string(item, "/status/phase").unwrap_or_else(|| "Unknown".into()),
+                container_statuses: statuses,
+            }
         })
-        .unwrap_or_default()
+        .collect()
+}
+
+fn resolve_deployment_owners(pods: &mut [ObservedPod], raw: &str, namespace: &str) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    let Some(items) = value.get("items").and_then(|v| v.as_array()) else {
+        return;
+    };
+    for pod in pods {
+        let Some((rs_name, rs_uid)) = &pod.replica_set else {
+            continue;
+        };
+        let Some(rs) = items.iter().find(|item| {
+            item.get("kind").and_then(|v| v.as_str()) == Some("ReplicaSet")
+                && json_string(item, "/metadata/name").as_ref() == Some(rs_name)
+                && json_string(item, "/metadata/uid").as_ref() == Some(rs_uid)
+                && json_string(item, "/metadata/namespace").as_deref() == Some(namespace)
+        }) else {
+            continue;
+        };
+        let Some((dep_name, dep_uid)) = controller_owner(rs, "Deployment") else {
+            continue;
+        };
+        if items.iter().any(|item| {
+            item.get("kind").and_then(|v| v.as_str()) == Some("Deployment")
+                && json_string(item, "/metadata/name").as_deref() == Some(dep_name.as_str())
+                && json_string(item, "/metadata/uid").as_deref() == Some(dep_uid.as_str())
+                && json_string(item, "/metadata/namespace").as_deref() == Some(namespace)
+        }) {
+            pod.deployment = Some(dep_name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod image_evidence_tests {
+    use super::*;
+    use crate::k8s::ObservationSource;
+    use serde_json::json;
+
+    fn signature(
+        spec: &str,
+        status: &str,
+        message: &str,
+    ) -> crate::domain::models::FailureSignature {
+        let value = json!({"items": [{
+            "metadata": {"name": "app-123", "uid": "pod-1"},
+            "spec": {"containers": [{"name": "app", "image": spec}]},
+            "status": {"phase": "Pending", "containerStatuses": [{
+                "name": "app", "image": status, "ready": false,
+                "state": {"waiting": {"reason": "ErrImagePull", "message": message}}
+            }]}
+        }]});
+        let mut pods = parse_pods_json(&value.to_string());
+        pods[0].deployment = Some("app".into());
+        crate::observe::observe(
+            &WorkloadObservation {
+                source: ObservationSource::Runtime,
+                events: vec![],
+                pods,
+                rendered_hint: None,
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn stale_status_cannot_confirm_current_image_absence() {
+        let sig = signature(
+            "registry.example/app:new",
+            "registry.example/app:old",
+            "manifest unknown",
+        );
+        assert_eq!(sig.class, "unknown");
+        assert_eq!(
+            sig.normalized.attributes.unwrap()["image_pull_cause"],
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn docker_hub_expansion_preserves_matching_image_identity() {
+        let sig = signature(
+            "busybox:arbitrary-tag",
+            "docker.io/library/busybox:arbitrary-tag",
+            "manifest unknown",
+        );
+        assert_eq!(sig.class, "bad_image_reference");
+        assert_eq!(
+            sig.normalized.attributes.unwrap()["image"],
+            "busybox:arbitrary-tag"
+        );
+    }
+
+    #[test]
+    fn classifies_causes_and_conflicts_without_image_name_sentinels() {
+        for (message, expected) in [
+            ("manifest unknown", "bad_image_reference"),
+            ("unauthorized: authentication required", "auth_denied"),
+            ("dial tcp: no such host", "network_error"),
+            ("toomanyrequests", "dependency_timeout"),
+            ("Back-off pulling image", "unknown"),
+            ("manifest unknown; unauthorized", "unknown"),
+            ("repository does not exist or may require login", "unknown"),
+        ] {
+            assert_eq!(
+                signature(
+                    "registry.example/app:v7",
+                    "registry.example/app:v7",
+                    message
+                )
+                .class,
+                expected,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_status_cannot_confirm_absence() {
+        let message = format!("manifest unknown{}; unauthorized", "x".repeat(2048));
+        assert_eq!(
+            signature(
+                "registry.example/app:v7",
+                "registry.example/app:v7",
+                &message
+            )
+            .class,
+            "unknown"
+        );
+    }
 }

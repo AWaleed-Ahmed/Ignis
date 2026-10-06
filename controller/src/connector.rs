@@ -202,6 +202,8 @@ pub enum ConnectorError {
     Unsupported(String),
     #[error("controller execution failed: {0}")]
     Execution(String),
+    #[error("controller execution timed out: {0}")]
+    Timeout(String),
     #[error("lease expired for job {0}")]
     LeaseExpired(String),
 }
@@ -247,7 +249,11 @@ pub struct ControllerExecutor {
 impl ControllerExecutor {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(300))
+                .build()
+                .expect("local controller HTTP client configuration is valid"),
             base_url: base_url.into().trim_end_matches('/').to_string(),
         }
     }
@@ -257,23 +263,26 @@ impl ControllerExecutor {
         path: &str,
         body: Value,
         action_id: Option<&str>,
+        budget: Duration,
     ) -> Result<Value, ConnectorError> {
         let mut request = self
             .client
             .post(format!("{}{}", self.base_url, path))
-            .json(&body);
+            .json(&body)
+            .timeout(budget);
         if let Some(action_id) = action_id {
             request = request.header("x-raphael-connector-action-id", action_id);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| ConnectorError::Execution(e.to_string()))?;
+        let response = request.send().await.map_err(controller_http_error)?;
         let status = response.status();
-        let payload: Value = response
-            .json()
-            .await
-            .map_err(|e| ConnectorError::Execution(e.to_string()))?;
+        let payload: Value = response.json().await.map_err(controller_http_error)?;
+        if status == reqwest::StatusCode::GATEWAY_TIMEOUT
+            || payload.pointer("/error/code").and_then(Value::as_str) == Some("timeout")
+        {
+            return Err(ConnectorError::Timeout(
+                "controller deadline exhausted".into(),
+            ));
+        }
         if !status.is_success() {
             return Err(ConnectorError::Execution(payload.to_string()));
         }
@@ -323,7 +332,24 @@ impl ActionExecutor for ControllerExecutor {
                 endpoint_suffix(&action.verb)?
             )
         };
-        let result = self.post(&path, body, Some(&action.action_id)).await?;
+        let budget = if action.verb == "deploy_revision" {
+            let seconds = action
+                .args
+                .get("deploy_timeout_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(crate::domain::models::default_deploy_timeout_seconds() as u64);
+            if !(1..=600).contains(&seconds) {
+                return Err(ConnectorError::Malformed(
+                    "deploy_timeout_seconds must be 1..600".into(),
+                ));
+            }
+            Duration::from_secs(seconds + 10)
+        } else {
+            Duration::from_secs(300)
+        };
+        let result = self
+            .post(&path, body, Some(&action.action_id), budget)
+            .await?;
         validate_response(&action.verb, &result)?;
         let _ = job;
         Ok(result)
@@ -335,7 +361,12 @@ impl ActionExecutor for ControllerExecutor {
         };
         let path = format!("/v1/sandboxes/{sandbox_id}/destroy");
         let result = self
-            .post(&path, json!({"reason": "connector_terminal"}), None)
+            .post(
+                &path,
+                json!({"reason": "connector_terminal"}),
+                None,
+                Duration::from_secs(70),
+            )
             .await?;
         validate_response("destroy_sandbox", &result)
     }
@@ -400,6 +431,21 @@ where
     }
 
     pub async fn rehydrate(&self) -> Result<(), ConnectorError> {
+        for record in self.recovery.cleanup_jobs() {
+            let local = LocalJob {
+                job: serde_json::from_value(record.job.clone())
+                    .map_err(|e| ConnectorError::Malformed(e.to_string()))?,
+                workspace_path: PathBuf::from(record.workspace_path.as_deref().unwrap_or("")),
+                sandbox_id: record.sandbox_id.clone(),
+                terminal: true,
+                processed_actions: HashMap::new(),
+            };
+            if self.cleanup_local_job(&local).await {
+                self.recovery
+                    .remove_job(&record.job_id)
+                    .map_err(ConnectorError::Execution)?;
+            }
+        }
         for record in self.recovery.active_jobs() {
             self.restore_job(&record.job_id).await?;
         }
@@ -752,27 +798,62 @@ where
             }
             return Ok(vec![cached.frame.clone()]);
         }
-        let result = match action.verb.as_str() {
-            "create_sandbox" => {
-                let value = self.executor.execute(&local.job, local, &action).await?;
-                validate_response("create_sandbox", &value)?;
-                local.sandbox_id = value
-                    .get("sandbox_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                if let Some(mut record) = self.recovery.job(&action.job_id) {
-                    record.sandbox_id = local.sandbox_id.clone();
-                    record.updated_at = Utc::now();
-                    self.recovery
-                        .save_job(record)
-                        .map_err(ConnectorError::Execution)?;
-                }
-                Ok(value)
+        if action.verb == "create_sandbox" {
+            let run_id = action
+                .args
+                .get("run_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ConnectorError::Malformed("create_sandbox.run_id is required".into())
+                })?;
+            let mut record = self.recovery.job(&action.job_id).ok_or_else(|| {
+                ConnectorError::Execution("create job has no recovery record".into())
+            })?;
+            if record.run_id != run_id {
+                return Err(ConnectorError::Malformed(
+                    "create_sandbox.run_id does not match the accepted job".into(),
+                ));
             }
+            let sandbox_id = crate::domain::ids::sandbox_id_from_run(run_id);
+            record.sandbox_id = Some(sandbox_id.clone());
+            record.updated_at = Utc::now();
+            self.recovery
+                .save_job(record)
+                .map_err(ConnectorError::Execution)?;
+            local.sandbox_id = Some(sandbox_id);
+        }
+        let result = match action.verb.as_str() {
+            "create_sandbox" => match self.executor.execute(&local.job, local, &action).await {
+                Ok(value) => {
+                    validate_response("create_sandbox", &value)?;
+                    local.sandbox_id = value
+                        .get("sandbox_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                    if let Some(mut record) = self.recovery.job(&action.job_id) {
+                        record.sandbox_id = local.sandbox_id.clone();
+                        record.updated_at = Utc::now();
+                        self.recovery
+                            .save_job(record)
+                            .map_err(ConnectorError::Execution)?;
+                    }
+                    Ok(value)
+                }
+                Err(error) => Err(error),
+            },
             _ => self.executor.execute(&local.job, local, &action).await,
         };
         let frame = match result {
             Ok(value) => self.result_frame(&action, "ok", Some(value), None),
+            Err(ConnectorError::Timeout(message)) => self.result_frame(
+                &action,
+                "timeout",
+                None,
+                Some(ErrorBody {
+                    code: "controller_timeout".into(),
+                    message,
+                }),
+            ),
             Err(ConnectorError::LeaseExpired(message)) => self.result_frame(
                 &action,
                 "timeout",
@@ -837,31 +918,41 @@ where
         };
         local.terminal = true;
         if terminal.instructions == "discard_local_copy" {
-            let mut cleanup_failed = false;
-            if let Err(error) = self.executor.destroy(&local).await {
-                warn!(job_id = %terminal.job_id, error = %error, "sandbox cleanup failed");
-                cleanup_failed = true;
-            }
-            if let Err(error) = tokio::fs::remove_dir_all(&local.workspace_path).await {
-                warn!(job_id = %terminal.job_id, error = %error, "workspace cleanup failed");
-                cleanup_failed = true;
-            }
-            if cleanup_failed {
-                if let Some(mut record) = self.recovery.job(&terminal.job_id) {
-                    record.terminal = true;
-                    record.cleanup_failed = true;
-                    record.updated_at = Utc::now();
-                    self.recovery
-                        .save_job(record)
-                        .map_err(ConnectorError::Execution)?;
-                }
-            } else {
+            // Journal cleanup intent before the HTTP call or file deletion. A
+            // restart must retry cleanup rather than restore terminal work.
+            let mut record = self.recovery.job(&terminal.job_id).ok_or_else(|| {
+                ConnectorError::Execution("terminal job has no recovery record".into())
+            })?;
+            record.terminal = true;
+            record.cleanup_failed = true;
+            record.updated_at = Utc::now();
+            self.recovery
+                .save_job(record)
+                .map_err(ConnectorError::Execution)?;
+            if self.cleanup_local_job(&local).await {
                 self.recovery
                     .remove_job(&terminal.job_id)
                     .map_err(ConnectorError::Execution)?;
             }
         }
         Ok(Vec::new())
+    }
+
+    async fn cleanup_local_job(&self, local: &LocalJob) -> bool {
+        let mut succeeded = true;
+        if let Err(error) = self.executor.destroy(local).await {
+            warn!(job_id = %local.job.job_id, error = %error, "sandbox cleanup failed; retaining recovery record");
+            succeeded = false;
+        }
+        if !local.workspace_path.as_os_str().is_empty() {
+            if let Err(error) = tokio::fs::remove_dir_all(&local.workspace_path).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(job_id = %local.job.job_id, error = %error, "workspace cleanup failed");
+                    succeeded = false;
+                }
+            }
+        }
+        succeeded
     }
 
     fn result_frame(
@@ -1131,6 +1222,7 @@ fn validate_action_args(verb: &str, args: &Value) -> Result<(), ConnectorError> 
                     "manifests",
                     "patch",
                     "wait_seconds",
+                    "deploy_timeout_seconds",
                 ],
                 verb,
             )?;
@@ -1286,11 +1378,20 @@ fn validate_response(verb: &str, value: &Value) -> Result<(), ConnectorError> {
     Ok(())
 }
 
+fn controller_http_error(error: reqwest::Error) -> ConnectorError {
+    if error.is_timeout() {
+        ConnectorError::Timeout("local controller request deadline exhausted".into())
+    } else {
+        ConnectorError::Execution(error.to_string())
+    }
+}
+
 fn error_code(error: &ConnectorError) -> &'static str {
     match error {
         ConnectorError::Malformed(_) => "malformed_envelope",
         ConnectorError::Unsupported(_) => "internal_error",
         ConnectorError::Execution(_) => "internal_error",
+        ConnectorError::Timeout(_) => "controller_timeout",
         ConnectorError::LeaseExpired(_) => "job_lease_expired",
     }
 }
@@ -1658,22 +1759,28 @@ mod tests {
     #[tokio::test]
     async fn terminal_discards_sandbox_and_workspace() {
         let fake = FakeExecutor::default();
-        let connector = Connector::new(config(), fake.clone());
         let job = job();
         let job_id = job.job_id.clone();
         let dir = tempdir().unwrap();
         let workspace = dir.path().join("workspace");
-        tokio::fs::create_dir_all(&workspace).await.unwrap();
-        connector.jobs.lock().await.insert(
-            job_id.clone(),
-            LocalJob {
-                job,
-                workspace_path: workspace.clone(),
-                sandbox_id: Some("sb-test".into()),
-                terminal: false,
-                processed_actions: HashMap::new(),
+        let connector = Connector::with_cloner(
+            config(),
+            fake.clone(),
+            FakeCloner {
+                workspace: workspace.clone(),
             },
         );
+        connector
+            .handle_job(job, "recovery-run", "connector")
+            .await
+            .unwrap();
+        connector
+            .jobs
+            .lock()
+            .await
+            .get_mut(&job_id)
+            .unwrap()
+            .sandbox_id = Some("sb-test".into());
         let terminal = envelope(
             "terminal",
             Some(job_id.clone()),
