@@ -870,3 +870,102 @@ fn resolve_deployment_owners(pods: &mut [ObservedPod], raw: &str, namespace: &st
         }
     }
 }
+
+#[cfg(test)]
+mod image_evidence_tests {
+    use super::*;
+    use crate::k8s::ObservationSource;
+    use serde_json::json;
+
+    fn signature(
+        spec: &str,
+        status: &str,
+        message: &str,
+    ) -> crate::domain::models::FailureSignature {
+        let value = json!({"items": [{
+            "metadata": {"name": "app-123", "uid": "pod-1"},
+            "spec": {"containers": [{"name": "app", "image": spec}]},
+            "status": {"phase": "Pending", "containerStatuses": [{
+                "name": "app", "image": status, "ready": false,
+                "state": {"waiting": {"reason": "ErrImagePull", "message": message}}
+            }]}
+        }]});
+        let mut pods = parse_pods_json(&value.to_string());
+        pods[0].deployment = Some("app".into());
+        crate::observe::observe(
+            &WorkloadObservation {
+                source: ObservationSource::Runtime,
+                events: vec![],
+                pods,
+                rendered_hint: None,
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn stale_status_cannot_confirm_current_image_absence() {
+        let sig = signature(
+            "registry.example/app:new",
+            "registry.example/app:old",
+            "manifest unknown",
+        );
+        assert_eq!(sig.class, "unknown");
+        assert_eq!(
+            sig.normalized.attributes.unwrap()["image_pull_cause"],
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn docker_hub_expansion_preserves_matching_image_identity() {
+        let sig = signature(
+            "busybox:arbitrary-tag",
+            "docker.io/library/busybox:arbitrary-tag",
+            "manifest unknown",
+        );
+        assert_eq!(sig.class, "bad_image_reference");
+        assert_eq!(
+            sig.normalized.attributes.unwrap()["image"],
+            "busybox:arbitrary-tag"
+        );
+    }
+
+    #[test]
+    fn classifies_causes_and_conflicts_without_image_name_sentinels() {
+        for (message, expected) in [
+            ("manifest unknown", "bad_image_reference"),
+            ("unauthorized: authentication required", "auth_denied"),
+            ("dial tcp: no such host", "network_error"),
+            ("toomanyrequests", "dependency_timeout"),
+            ("Back-off pulling image", "unknown"),
+            ("manifest unknown; unauthorized", "unknown"),
+            ("repository does not exist or may require login", "unknown"),
+        ] {
+            assert_eq!(
+                signature(
+                    "registry.example/app:v7",
+                    "registry.example/app:v7",
+                    message
+                )
+                .class,
+                expected,
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_status_cannot_confirm_absence() {
+        let message = format!("manifest unknown{}; unauthorized", "x".repeat(2048));
+        assert_eq!(
+            signature(
+                "registry.example/app:v7",
+                "registry.example/app:v7",
+                &message
+            )
+            .class,
+            "unknown"
+        );
+    }
+}

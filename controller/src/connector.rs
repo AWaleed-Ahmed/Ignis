@@ -1759,22 +1759,28 @@ mod tests {
     #[tokio::test]
     async fn terminal_discards_sandbox_and_workspace() {
         let fake = FakeExecutor::default();
-        let connector = Connector::new(config(), fake.clone());
         let job = job();
         let job_id = job.job_id.clone();
         let dir = tempdir().unwrap();
         let workspace = dir.path().join("workspace");
-        tokio::fs::create_dir_all(&workspace).await.unwrap();
-        connector.jobs.lock().await.insert(
-            job_id.clone(),
-            LocalJob {
-                job,
-                workspace_path: workspace.clone(),
-                sandbox_id: Some("sb-test".into()),
-                terminal: false,
-                processed_actions: HashMap::new(),
+        let connector = Connector::with_cloner(
+            config(),
+            fake.clone(),
+            FakeCloner {
+                workspace: workspace.clone(),
             },
         );
+        connector
+            .handle_job(job, "recovery-run", "connector")
+            .await
+            .unwrap();
+        connector
+            .jobs
+            .lock()
+            .await
+            .get_mut(&job_id)
+            .unwrap()
+            .sandbox_id = Some("sb-test".into());
         let terminal = envelope(
             "terminal",
             Some(job_id.clone()),
