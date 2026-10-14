@@ -2,8 +2,8 @@ use serde::Deserialize;
 use serde_yaml::Value;
 
 use crate::domain::models::{
-    AppliedSecretFixtureInventory, SecretCoverageReport, SecretCoverageStatus,
-    SecretReferenceCoverage,
+    AppliedSecretFixture, AppliedSecretFixtureInventory, SecretCoverageReport,
+    SecretCoverageStatus, SecretReferenceCoverage,
 };
 
 const FORMAT_VERSION: u32 = 1;
@@ -89,6 +89,67 @@ pub fn evaluate_secret_coverage(
     report
 }
 
+/// Extract names and keys from explicitly fixture-labelled Secrets bundled in
+/// the rendered workload. Secret values are deliberately never copied.
+pub fn bundled_fixture_secrets(yaml: &str, namespace: &str) -> (Vec<AppliedSecretFixture>, bool) {
+    let mut secrets = Vec::new();
+    let mut complete = true;
+    for document in serde_yaml::Deserializer::from_str(yaml) {
+        let value = match Value::deserialize(document) {
+            Ok(value) => value,
+            Err(_) => {
+                complete = false;
+                break;
+            }
+        };
+        if string_at(&value, &["kind"]) != Some("Secret")
+            || string_at(&value, &["metadata", "labels", "raphael.secret_fixture"]) != Some("true")
+        {
+            continue;
+        }
+        if string_at(&value, &["metadata", "namespace"]).is_some_and(|value| value != namespace) {
+            continue;
+        }
+        let Some(name) = string_at(&value, &["metadata", "name"]) else {
+            complete = false;
+            continue;
+        };
+        let mut keys = Vec::new();
+        for field in ["data", "stringData"] {
+            if let Some(data) = value.get(field) {
+                let Some(mapping) = data.as_mapping() else {
+                    complete = false;
+                    continue;
+                };
+                for key in mapping.keys() {
+                    let Some(key) = key.as_str() else {
+                        complete = false;
+                        continue;
+                    };
+                    if !keys.iter().any(|existing| existing == key) {
+                        keys.push(key.to_string());
+                    }
+                }
+            }
+        }
+        keys.sort();
+        if secrets
+            .iter()
+            .any(|existing: &AppliedSecretFixture| existing.name == name)
+        {
+            // Duplicate applied Secret identities have order-dependent results;
+            // do not union their keys and accidentally claim false coverage.
+            complete = false;
+        } else {
+            secrets.push(AppliedSecretFixture {
+                name: name.to_string(),
+                keys,
+            });
+        }
+    }
+    (secrets, complete)
+}
+
 fn collect_workload_references(
     document: &Value,
     sandbox_namespace: &str,
@@ -170,6 +231,9 @@ fn collect_workload_references(
     if has(pod_spec, "ephemeralContainers") {
         *complete = false;
     }
+    if has(pod_spec, "imagePullSecrets") {
+        *complete = false;
+    }
     if has(pod_spec, "volumes") {
         let Some(volumes) = array(pod_spec, "volumes") else {
             *complete = false;
@@ -207,9 +271,20 @@ fn collect_container_references(
             return;
         };
         for variable in env {
-            let Some(source) = path(variable, &["valueFrom", "secretKeyRef"]) else {
+            let Some(value_from) = path(variable, &["valueFrom"]) else {
                 continue;
             };
+            if !value_from.is_mapping() {
+                *complete = false;
+                continue;
+            }
+            let Some(source) = value_from.get("secretKeyRef") else {
+                continue;
+            };
+            if !source.is_mapping() {
+                *complete = false;
+                continue;
+            }
             add_reference(
                 references,
                 truncated,
@@ -226,7 +301,10 @@ fn collect_container_references(
                     status: SecretCoverageStatus::Unknown,
                 },
             );
-            if string_at(source, &["name"]).is_none() || string_at(source, &["key"]).is_none() {
+            if string_at(source, &["name"]).is_none()
+                || string_at(source, &["key"]).is_none()
+                || (has_value(source, "optional") && bool_at(source, "optional").is_none())
+            {
                 *complete = false;
             }
         }
@@ -237,9 +315,17 @@ fn collect_container_references(
             return;
         };
         for source in env_from {
-            let Some(secret_ref) = path(source, &["secretRef"]) else {
+            if !source.is_mapping() {
+                *complete = false;
+                continue;
+            }
+            let Some(secret_ref) = source.get("secretRef") else {
                 continue;
             };
+            if !secret_ref.is_mapping() {
+                *complete = false;
+                continue;
+            }
             add_reference(
                 references,
                 truncated,
@@ -256,7 +342,9 @@ fn collect_container_references(
                     status: SecretCoverageStatus::Unknown,
                 },
             );
-            if string_at(secret_ref, &["name"]).is_none() {
+            if string_at(secret_ref, &["name"]).is_none()
+                || (has_value(secret_ref, "optional") && bool_at(secret_ref, "optional").is_none())
+            {
                 *complete = false;
             }
         }
@@ -273,26 +361,49 @@ fn collect_volume_references(
     truncated: &mut bool,
 ) {
     let volume_name = string_at(volume, &["name"]).map(str::to_string);
-    if let Some(secret) = path(volume, &["secret"]) {
-        add_volume_secret(
-            secret,
-            "volumes.secret",
-            workload_kind,
-            workload_name,
-            namespace,
-            volume_name.clone(),
-            references,
-            complete,
-            truncated,
-        );
+    if has_value(volume, "csi") {
+        *complete = false;
     }
-    if let Some(projected) = path(volume, &["projected"]) {
+    if !volume.is_mapping() {
+        *complete = false;
+        return;
+    }
+    if let Some(secret) = volume.get("secret") {
+        if secret.is_mapping() {
+            add_volume_secret(
+                secret,
+                "volumes.secret",
+                workload_kind,
+                workload_name,
+                namespace,
+                volume_name.clone(),
+                references,
+                complete,
+                truncated,
+            );
+        } else {
+            *complete = false;
+        }
+    }
+    if let Some(projected) = volume.get("projected") {
+        if !projected.is_mapping() {
+            *complete = false;
+            return;
+        }
         let Some(sources) = array_value(projected, "sources") else {
             *complete = false;
             return;
         };
         for source in sources {
-            if let Some(secret) = path(source, &["secret"]) {
+            if !source.is_mapping() {
+                *complete = false;
+                continue;
+            }
+            if let Some(secret) = source.get("secret") {
+                if !secret.is_mapping() {
+                    *complete = false;
+                    continue;
+                }
                 add_volume_secret(
                     secret,
                     "volumes.projected.secret",
@@ -304,6 +415,10 @@ fn collect_volume_references(
                     complete,
                     truncated,
                 );
+            } else {
+                // ConfigMap, downwardAPI, serviceAccountToken and future
+                // projected source kinds are outside this coverage model.
+                *complete = false;
             }
         }
     }
@@ -328,6 +443,9 @@ fn add_volume_secret(
     };
     let secret_name = string_at(secret, &[name_field]).map(str::to_string);
     let optional = bool_at(secret, "optional").unwrap_or(false);
+    if has_value(secret, "optional") && bool_at(secret, "optional").is_none() {
+        *complete = false;
+    }
     let keys = if has_value(secret, "items") {
         let Some(items) = array_value(secret, "items") else {
             *complete = false;
@@ -589,6 +707,92 @@ mod tests {
             deployment("      ephemeralContainers:\n      - name: debug\n        image: busybox\n");
         assert!(!evaluate(&unsupported, Some(&inventory(vec![]))).complete);
         assert!(!evaluate("kind: Deployment\nspec: [", Some(&inventory(vec![]))).complete);
+    }
+
+    #[test]
+    fn image_pull_secrets_are_never_reported_as_complete_coverage() {
+        let yaml = deployment(
+            "      imagePullSecrets:\n      - name: registry-credentials\n      containers:\n      - name: api\n        image: busybox\n",
+        );
+        let report = evaluate(&yaml, Some(&inventory(vec![])));
+        assert!(!report.complete);
+        assert!(report.references.is_empty());
+    }
+
+    #[test]
+    fn csi_volume_is_never_reported_as_complete_coverage() {
+        let yaml = deployment(
+            "      containers:\n      - name: api\n      volumes:\n      - name: credentials\n        csi:\n          driver: secrets-store.csi.k8s.io\n          volumeAttributes:\n            secretProviderClass: payments\n",
+        );
+        assert!(!evaluate(&yaml, Some(&inventory(vec![]))).complete);
+    }
+
+    #[test]
+    fn non_secret_projected_source_is_never_silently_skipped() {
+        let yaml = deployment(
+            "      containers:\n      - name: api\n      volumes:\n      - name: projected\n        projected:\n          sources:\n          - configMap:\n              name: app-settings\n",
+        );
+        assert!(!evaluate(&yaml, Some(&inventory(vec![]))).complete);
+    }
+
+    #[test]
+    fn malformed_image_pull_secret_reference_is_incomplete() {
+        let yaml = deployment(
+            "      imagePullSecrets: invalid\n      containers:\n      - name: api\n        image: busybox\n",
+        );
+        assert!(!evaluate(&yaml, Some(&inventory(vec![]))).complete);
+    }
+
+    #[test]
+    fn malformed_secret_reference_shapes_are_incomplete() {
+        let yaml = deployment(
+            "      containers:\n      - name: api\n        env:\n        - name: TOKEN\n          valueFrom:\n            secretKeyRef: not-a-map\n        envFrom:\n        - secretRef: not-a-map\n      volumes:\n      - name: credentials\n        secret: not-a-map\n",
+        );
+        assert!(!evaluate(&yaml, Some(&inventory(vec![]))).complete);
+    }
+
+    #[test]
+    fn invalid_optional_flag_is_incomplete_not_treated_as_required_or_covered() {
+        let yaml = deployment(
+            "      containers:\n      - name: api\n        envFrom:\n        - secretRef:\n            name: missing\n            optional: 'sometimes'\n",
+        );
+        let report = evaluate(&yaml, Some(&inventory(vec![])));
+        assert!(!report.complete);
+        assert_eq!(report.references[0].status, SecretCoverageStatus::Unknown);
+    }
+
+    #[test]
+    fn bundled_fixture_secret_extraction_keeps_only_labelled_names_and_keys() {
+        let yaml = "apiVersion: v1\nkind: Secret\nmetadata:\n  name: bundled\n  labels:\n    raphael.secret_fixture: 'true'\nstringData:\n  TOKEN: SYNTHETIC_BUNDLED_SENTINEL\n---\napiVersion: v1\nkind: Secret\nmetadata:\n  name: unlabelled\nstringData:\n  TOKEN: SYNTHETIC_UNLABELLED_SENTINEL\n";
+        let (secrets, complete) = bundled_fixture_secrets(yaml, "sandbox-a");
+        assert!(complete);
+        assert_eq!(
+            secrets,
+            vec![AppliedSecretFixture {
+                name: "bundled".into(),
+                keys: vec!["TOKEN".into()],
+            }]
+        );
+        let serialized = serde_json::to_string(&secrets).unwrap();
+        assert!(!serialized.contains("SYNTHETIC_BUNDLED_SENTINEL"));
+        assert!(!serialized.contains("SYNTHETIC_UNLABELLED_SENTINEL"));
+
+        let reference = deployment(
+            "      containers:\n      - name: api\n        envFrom:\n        - secretRef:\n            name: bundled\n",
+        );
+        let covered = evaluate(&reference, Some(&inventory(secrets)));
+        assert_eq!(covered.references[0].status, SecretCoverageStatus::Covered);
+        let (unlabelled, complete) = bundled_fixture_secrets(
+            "apiVersion: v1\nkind: Secret\nmetadata:\n  name: unlabelled\nstringData:\n  TOKEN: ignored\n",
+            "sandbox-a",
+        );
+        assert!(complete);
+        assert!(unlabelled.is_empty());
+        let no_implicit_fixture = evaluate(&reference, Some(&inventory(unlabelled)));
+        assert_eq!(
+            no_implicit_fixture.references[0].status,
+            SecretCoverageStatus::MissingObject
+        );
     }
 
     #[test]

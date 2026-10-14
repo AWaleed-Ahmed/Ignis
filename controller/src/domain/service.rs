@@ -239,8 +239,15 @@ impl SandboxService {
         }
 
         let tool_versions = crate::tools::collect_tool_versions();
+        let fixture_inventory = inventory_with_bundled_fixtures(
+            record.applied_secret_fixtures.as_ref(),
+            &rendered.yaml,
+            &record.namespace,
+        );
+        let mut fidelity_record = record.clone();
+        fidelity_record.applied_secret_fixtures = Some(fixture_inventory.clone());
         let fidelity = build_fidelity(
-            &record,
+            &fidelity_record,
             &req,
             &rendered.render_path,
             &apply.image_refs,
@@ -261,6 +268,7 @@ impl SandboxService {
                 r.resources = apply.resources.clone();
                 r.image_refs = image_refs.clone();
                 r.last_fidelity = Some(fidelity.clone());
+                r.applied_secret_fixtures = Some(fixture_inventory.clone());
                 r.last_patch = req.patch.clone();
                 // A new deploy invalidates any previous finalize for safety.
                 r.finalized_result = None;
@@ -1203,26 +1211,47 @@ fn build_fidelity(
         &record.namespace,
         record.applied_secret_fixtures.as_ref(),
     );
-    if secret_coverage.references.iter().any(|reference| {
-        !reference.optional
-            && matches!(
-                reference.status,
-                SecretCoverageStatus::MissingObject | SecretCoverageStatus::MissingKey
-            )
-    }) {
-        gaps.push(
-            "required Secret references are not covered by applied synthetic fixtures".into(),
-        );
+    let unresolved = secret_coverage
+        .references
+        .iter()
+        .filter(|reference| {
+            !reference.optional
+                && matches!(
+                    reference.status,
+                    SecretCoverageStatus::MissingObject | SecretCoverageStatus::MissingKey
+                )
+        })
+        .collect::<Vec<_>>();
+    if !unresolved.is_empty() {
+        let mut names = unresolved
+            .iter()
+            .map(|reference| {
+                let name = reference.secret_name.as_deref().unwrap_or("<unnamed>");
+                let identity = reference
+                    .key
+                    .as_deref()
+                    .map(|key| format!("{name}[{key}]"))
+                    .unwrap_or_else(|| name.to_string());
+                format!("{}/{}", reference.namespace, identity)
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        gaps.push(format!(
+            "required Secret references are uncovered: {}",
+            names.join(", ")
+        ));
     } else if !secret_coverage.complete {
         gaps.push("Secret fixture coverage is incomplete or unknown".into());
     }
+    let dependencies_available = unresolved.is_empty();
     let checklist = FidelityChecklist {
         same_commit,
         same_render_path: !render_path.is_empty(),
         same_image_digest_or_tag: !expected_images.is_empty(),
         equivalent_k8s_semantics: !self_is_mock(record),
         equivalent_non_secret_config: true,
-        dependencies_available: true,
+        dependencies_available,
     };
     let score = {
         let flags = [
@@ -1242,6 +1271,59 @@ fn build_fidelity(
         material_gaps: gaps,
         secret_coverage: Some(secret_coverage),
     }
+}
+
+fn inventory_with_bundled_fixtures(
+    existing: Option<&AppliedSecretFixtureInventory>,
+    rendered_yaml: &str,
+    namespace: &str,
+) -> AppliedSecretFixtureInventory {
+    let (bundled, bundle_complete) =
+        crate::secret_coverage::bundled_fixture_secrets(rendered_yaml, namespace);
+    let mut inventory = existing
+        .cloned()
+        .unwrap_or_else(|| AppliedSecretFixtureInventory {
+            namespace: namespace.to_string(),
+            fixture_set: None,
+            complete: false,
+            truncated: false,
+            secrets: Vec::new(),
+        });
+    inventory.complete &= bundle_complete;
+
+    const MAX_SECRETS: usize = 128;
+    const MAX_KEYS: usize = 1_024;
+    let mut secrets = Vec::new();
+    let mut key_count = 0;
+    for secret in inventory.secrets.into_iter().chain(bundled) {
+        if secrets
+            .iter()
+            .any(|existing: &AppliedSecretFixture| existing.name == secret.name)
+        {
+            // Bundled resources are applied after fixture-set Secrets. A name
+            // collision may alter the actual key set, so do not claim coverage.
+            inventory.complete = false;
+            continue;
+        }
+        if secrets.len() >= MAX_SECRETS {
+            inventory.complete = false;
+            inventory.truncated = true;
+            continue;
+        }
+        let remaining = MAX_KEYS.saturating_sub(key_count);
+        if secret.keys.len() > remaining {
+            inventory.complete = false;
+            inventory.truncated = true;
+        }
+        let keys = secret.keys.into_iter().take(remaining).collect::<Vec<_>>();
+        key_count += keys.len();
+        secrets.push(AppliedSecretFixture {
+            name: secret.name,
+            keys,
+        });
+    }
+    inventory.secrets = secrets;
+    inventory
 }
 
 fn bounded_fixture_metadata(
@@ -1403,5 +1485,292 @@ mod secret_inventory_tests {
             }]);
         assert_eq!(secrets[0].keys.len(), 1024);
         assert!(truncated);
+    }
+}
+
+#[cfg(test)]
+mod secret_coverage_fidelity_tests {
+    use super::*;
+    use crate::k8s::mock::MockCluster;
+    use crate::state::sqlite::SqliteStore;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::writer::MakeWriter;
+
+    const FIXTURE_SENTINEL: &str = "SYNTHETIC_FIXTURE_VALUE_SENTINEL_7c42";
+    const BUNDLED_SENTINEL: &str = "SYNTHETIC_BUNDLED_VALUE_SENTINEL_9d13";
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Capture {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn fidelity_record(complete: bool) -> SandboxRecord {
+        let mut record: SandboxRecord = serde_json::from_value(serde_json::json!({
+            "sandbox_id": "sb-secret-coverage",
+            "run_id": "secret-coverage",
+            "tenant_id": "tenant",
+            "namespace": "sandbox-a",
+            "commit_sha": "abcdef0123456789",
+            "repository_owner": "owner",
+            "repository_name": "repo",
+            "status": "ready",
+            "created_at": "2026-10-01T00:00:00Z",
+            "expires_at": "2026-10-01T01:00:00Z",
+            "service_account": "sandbox",
+            "image_refs": [],
+            "resources": [],
+            "artifacts": [],
+            "cluster_backend": "kubectl"
+        }))
+        .unwrap();
+        record.applied_secret_fixtures = Some(AppliedSecretFixtureInventory {
+            namespace: "sandbox-a".into(),
+            fixture_set: None,
+            complete,
+            truncated: false,
+            secrets: vec![AppliedSecretFixture {
+                name: "db".into(),
+                keys: vec!["URL".into()],
+            }],
+        });
+        record
+    }
+
+    fn fidelity_request() -> DeployRevisionRequest {
+        serde_json::from_value(serde_json::json!({
+            "repository_sha": "abcdef0123456789",
+            "manifests": {"type": "yaml", "path": "app.yaml"},
+            "wait_seconds": 0
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn dependency_checklist_is_false_only_for_positive_required_gaps() {
+        let missing_key = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: api\nspec:\n  containers:\n  - name: api\n    image: busybox\n    env:\n    - name: PASSWORD\n      valueFrom:\n        secretKeyRef:\n          name: db\n          key: PASSWORD\n";
+        let missing = build_fidelity(
+            &fidelity_record(true),
+            &fidelity_request(),
+            "yaml",
+            &[],
+            &ImageDigests::new(),
+            missing_key,
+        );
+        assert!(!missing.checklist.dependencies_available);
+        assert!(missing
+            .material_gaps
+            .iter()
+            .any(|gap| { gap.contains("sandbox-a/db[PASSWORD]") }));
+
+        let unknown = build_fidelity(
+            &fidelity_record(false),
+            &fidelity_request(),
+            "yaml",
+            &[],
+            &ImageDigests::new(),
+            missing_key,
+        );
+        assert!(unknown.checklist.dependencies_available);
+        assert!(!unknown.secret_coverage.unwrap().complete);
+
+        let optional = "apiVersion: v1\nkind: Pod\nmetadata:\n  name: api\nspec:\n  containers:\n  - name: api\n    image: busybox\n    envFrom:\n    - secretRef:\n        name: optional-secret\n        optional: true\n";
+        let optional = build_fidelity(
+            &fidelity_record(true),
+            &fidelity_request(),
+            "yaml",
+            &[],
+            &ImageDigests::new(),
+            optional,
+        );
+        assert!(optional.checklist.dependencies_available);
+    }
+
+    #[tokio::test]
+    async fn sentinel_values_stay_outside_named_raw_manifest_channels() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let manifest = format!(
+            "apiVersion: v1\nkind: Secret\nmetadata:\n  name: bundled-secret\n  labels:\n    raphael.secret_fixture: \"true\"\nstringData:\n  BUNDLED_TOKEN: {BUNDLED_SENTINEL}\n---\napiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n  template:\n    spec:\n      containers:\n      - name: api\n        image: busybox:1.37.0\n        env:\n        - name: FIXTURE_TOKEN\n          valueFrom:\n            secretKeyRef:\n              name: fixture-secret\n              key: FIXTURE_TOKEN\n        - name: BUNDLED_TOKEN\n          valueFrom:\n            secretKeyRef:\n              name: bundled-secret\n              key: BUNDLED_TOKEN\n"
+        );
+        std::fs::write(workspace.path().join("app.yaml"), manifest).unwrap();
+
+        let store = Arc::new(SqliteStore::open(data.path().join("records.sqlite")).unwrap());
+        let registry = Arc::new(SandboxRegistry::with_store(store.clone()).unwrap());
+        let service = SandboxService::new(Arc::new(MockCluster::new()), registry.clone());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(Capture(captured.clone()))
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _trace_guard = tracing::dispatcher::set_default(&dispatch);
+
+        let create_req: CreateSandboxRequest = serde_json::from_value(serde_json::json!({
+            "run_id": format!("coverage-sentinel-{}", Uuid::new_v4()),
+            "tenant_id": "test",
+            "repository": {"owner": "test", "name": "test"},
+            "commit_sha": "abcdef0123456789",
+            "secret_fixture_set": "coverage-sentinel"
+        }))
+        .unwrap();
+        let created = service.create_sandbox(create_req).await.unwrap();
+        let create_response = serde_json::to_string(&created).unwrap();
+        assert!(!create_response.contains(FIXTURE_SENTINEL));
+        assert!(!create_response.contains(BUNDLED_SENTINEL));
+
+        let deployed = service
+            .deploy_revision(
+                &created.sandbox_id,
+                DeployRevisionRequest {
+                    repository_sha: "abcdef0123456789".into(),
+                    workspace_path: Some(workspace.path().display().to_string()),
+                    manifests: ManifestSpec {
+                        manifest_type: "yaml".into(),
+                        path: Some("app.yaml".into()),
+                        chart: None,
+                        values: None,
+                        overlay: None,
+                        release_name: None,
+                    },
+                    patch: None,
+                    wait_seconds: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(deployed.fidelity.checklist.dependencies_available, true);
+        assert!(deployed.fidelity.secret_coverage.as_ref().unwrap().complete);
+        assert!(deployed
+            .fidelity
+            .secret_coverage
+            .as_ref()
+            .unwrap()
+            .references
+            .iter()
+            .all(|reference| reference.status == SecretCoverageStatus::Covered));
+        let mut reference_identities = deployed
+            .fidelity
+            .secret_coverage
+            .as_ref()
+            .unwrap()
+            .references
+            .iter()
+            .map(|reference| {
+                (
+                    reference.secret_name.clone().unwrap(),
+                    reference.key.clone().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        reference_identities.sort();
+        assert_eq!(
+            reference_identities,
+            vec![
+                ("bundled-secret".into(), "BUNDLED_TOKEN".into()),
+                ("fixture-secret".into(), "FIXTURE_TOKEN".into())
+            ]
+        );
+
+        let mut response_without_raw_files = serde_json::to_value(&deployed).unwrap();
+        let files = response_without_raw_files
+            .as_object_mut()
+            .unwrap()
+            .remove("rendered_files")
+            .unwrap();
+        assert!(files.to_string().contains(BUNDLED_SENTINEL));
+        assert!(!files.to_string().contains(FIXTURE_SENTINEL));
+        assert!(!response_without_raw_files
+            .to_string()
+            .contains(FIXTURE_SENTINEL));
+        assert!(!response_without_raw_files
+            .to_string()
+            .contains(BUNDLED_SENTINEL));
+
+        let persisted = registry.get(&created.sandbox_id).unwrap();
+        assert!(persisted
+            .rendered_yaml
+            .as_deref()
+            .unwrap()
+            .contains(BUNDLED_SENTINEL));
+        assert!(!persisted
+            .rendered_yaml
+            .as_deref()
+            .unwrap()
+            .contains(FIXTURE_SENTINEL));
+        let manifest_artifact = persisted
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "manifest")
+            .unwrap();
+        let artifact_path = manifest_artifact.path.as_ref().unwrap();
+        assert!(std::fs::read_to_string(artifact_path)
+            .unwrap()
+            .contains(BUNDLED_SENTINEL));
+        assert!(!manifest_artifact.content.contains(FIXTURE_SENTINEL));
+        let persisted_json = serde_json::to_value(&persisted).unwrap();
+        let mut outside_raw_channels = persisted_json.clone();
+        let object = outside_raw_channels.as_object_mut().unwrap();
+        object.remove("rendered_yaml");
+        if let Some(artifacts) = object
+            .get_mut("artifacts")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            artifacts.retain(|artifact| {
+                artifact.get("kind").and_then(serde_json::Value::as_str) != Some("manifest")
+            });
+        }
+        assert!(!outside_raw_channels.to_string().contains(FIXTURE_SENTINEL));
+        assert!(!outside_raw_channels.to_string().contains(BUNDLED_SENTINEL));
+
+        let persisted_from_store = store
+            .load_all()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.sandbox_id == created.sandbox_id)
+            .unwrap();
+        let persisted_store_json = serde_json::to_value(&persisted_from_store).unwrap();
+        assert!(!persisted_store_json.to_string().contains(FIXTURE_SENTINEL));
+        let mut persisted_store_outside_raw_channels = persisted_store_json;
+        let object = persisted_store_outside_raw_channels
+            .as_object_mut()
+            .unwrap();
+        object.remove("rendered_yaml");
+        if let Some(artifacts) = object
+            .get_mut("artifacts")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            artifacts.retain(|artifact| {
+                artifact.get("kind").and_then(serde_json::Value::as_str) != Some("manifest")
+            });
+        }
+        assert!(!persisted_store_outside_raw_channels
+            .to_string()
+            .contains(BUNDLED_SENTINEL));
+        let log = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(!log.contains(FIXTURE_SENTINEL));
+        assert!(!log.contains(BUNDLED_SENTINEL));
+
+        service
+            .destroy_sandbox(&created.sandbox_id, DestroySandboxRequest { reason: None })
+            .await
+            .unwrap();
     }
 }

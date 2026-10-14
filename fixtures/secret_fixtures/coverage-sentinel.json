@@ -1,0 +1,11 @@
+{
+  "name": "coverage-sentinel",
+  "secrets": [
+    {
+      "name": "fixture-secret",
+      "data": {
+        "FIXTURE_TOKEN": "SYNTHETIC_FIXTURE_VALUE_SENTINEL_7c42"
+      }
+    }
+  ]
+}
