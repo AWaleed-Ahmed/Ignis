@@ -200,14 +200,29 @@ impl SandboxService {
         sandbox_id: &str,
         req: DeployRevisionRequest,
     ) -> Result<DeployRevisionResponse, DomainError> {
+        self.deploy_revision_until(sandbox_id, req, None).await
+    }
+
+    pub async fn deploy_revision_until(
+        &self,
+        sandbox_id: &str,
+        req: DeployRevisionRequest,
+        action_deadline: Option<crate::deadline::Deadline>,
+    ) -> Result<DeployRevisionResponse, DomainError> {
         if !(1..=600).contains(&req.deploy_timeout_seconds) || req.wait_seconds > 600 {
             return Err(DomainError::InvalidRequest(
                 "deploy_timeout_seconds must be 1..600 and wait_seconds 0..600".into(),
             ));
         }
-        let deadline =
-            crate::deadline::Deadline::new(Duration::from_secs(req.deploy_timeout_seconds as u64));
-        let _operation = self.lock_sandbox(sandbox_id).await?;
+        let budget = Duration::from_secs(req.deploy_timeout_seconds as u64);
+        let budget = match action_deadline {
+            Some(deadline) => deadline.cap(budget)?,
+            None => budget,
+        };
+        let deadline = crate::deadline::Deadline::new(budget);
+        let _operation = timeout(deadline.remaining()?, self.lock_sandbox(sandbox_id))
+            .await
+            .map_err(|_| DomainError::Timeout("deployment lock deadline exhausted".into()))??;
         let record = self.require_ready(sandbox_id)?;
         let workspace = resolve_workspace(
             req.workspace_path.as_deref(),
@@ -1516,5 +1531,33 @@ mod secret_inventory_tests {
             }]);
         assert_eq!(secrets[0].keys.len(), 1024);
         assert!(truncated);
+    }
+}
+
+#[cfg(test)]
+mod action_deadline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn deployment_lock_wait_uses_action_deadline_not_the_body_default() {
+        let service = SandboxService::new(
+            Arc::new(crate::k8s::mock::MockCluster::new()),
+            Arc::new(SandboxRegistry::new()),
+        );
+        let _held = service.lock_sandbox("sb-deadline").await.unwrap();
+        let request: DeployRevisionRequest = serde_json::from_value(serde_json::json!({
+            "repository_sha":"abcdef1234567", "manifests":{"type":"yaml", "path":"app.yaml"}
+        }))
+        .unwrap();
+        let start = Instant::now();
+        let result = service
+            .deploy_revision_until(
+                "sb-deadline",
+                request,
+                Some(crate::deadline::Deadline::new(Duration::from_millis(20))),
+            )
+            .await;
+        assert!(matches!(result, Err(DomainError::Timeout(_))));
+        assert!(start.elapsed() < Duration::from_millis(500));
     }
 }

@@ -125,7 +125,7 @@ pub async fn deploy_revision(
             &headers,
             sandbox_id.clone(),
             body,
-            service.deploy_revision(&sandbox_id, req),
+            service.deploy_revision_until(&sandbox_id, req, request_deadline(&headers)?),
         )
         .await?,
     ))
