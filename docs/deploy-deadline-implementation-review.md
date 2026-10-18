@@ -70,3 +70,13 @@ No tests were added or executed in this implementation batch. Compilation of tes
 5. Complete controlled kind/hosted integration evidence. Existing larger harness leases do not qualify heartbeat behavior.
 
 #11 and #13 implementation has not started. The saved Raphael plan specifies #17 → #11 → #13. No issue is marked done by this document.
+
+## 2026-10-18 preservation checkpoint
+
+The `feature/ignis-11-13-17-completion` branch preserves candidate `c2597f7`
+with this review and the shared
+[completion checklist](ignis-11-13-17-completion-checklist.md). The later local
+lease/checkout fix commits are missing; this candidate does not contain the
+completed heartbeat or #13 clone-policy work. The checklist records missing
+code, current qualification requirements and release order. Historical test
+reports for lost heads are not evidence for this branch. #17 remains open.
