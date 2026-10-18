@@ -85,7 +85,7 @@ paths:
   /v1/results:
     post:
       operationId: acceptConnectorResult
-      description: Accept one result for the active owned action. Persist transition and lease checks atomically. Concurrent in-flight submissions return retryable HTTP 409; completed identical results are idempotent.
+      description: Accept one result for the active owned action. Persist transition and lease checks atomically. Concurrent in-flight submissions return retryable HTTP 409; completed identical results are idempotent. A persisted terminal envelope is replayed for cleanup reconciliation, including after restart, subject to the same tenant, connector-owner and payload-fingerprint checks. Completed jobs are not re-enqueued.
       requestBody:
         required: true
         content:

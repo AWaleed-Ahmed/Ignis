@@ -85,3 +85,16 @@ The entire result exchange, including response-body decoding, is selected
 against lease loss and bounded by its execution/transport budget. Failed
 preparation is journaled for cleanup; missing preparation workspaces at
 restart are cleaned safely rather than preventing other jobs from recovering.
+
+### Completed terminal result replay
+
+An identical committed result can return its persisted terminal envelope again
+with `idempotent_replay: true`, including after dispatcher restart. Tenant,
+connector-owner and payload-fingerprint checks still apply. Terminal replay is
+for cleanup reconciliation; completed jobs are not re-enqueued and executable
+patch content is not replayed. Older terminal records without this envelope
+retain their previous recovery limitation. The connector retries the cached
+result within its existing execution deadline and confirmed lease. At most
+three failed transport/429/5xx exchanges are allowed; in-progress409 responses
+share the same deadline. A final delivery failure uses journaled cleanup, with
+failed cleanup retained for restart.
