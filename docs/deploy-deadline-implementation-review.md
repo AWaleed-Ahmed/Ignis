@@ -80,3 +80,13 @@ lease/checkout fix commits are missing; this candidate does not contain the
 completed heartbeat or #13 clone-policy work. The checklist records missing
 code, current qualification requirements and release order. Historical test
 reports for lost heads are not evidence for this branch. #17 remains open.
+
+## Recovery checkpoint — 2026-10-19
+
+The missing #13/#17 source has now been recovered/reimplemented on persistent
+`fix/restore-clone-leases` branches, with additional review fixes and fresh local
+verification. See [the detailed recovery review](restore-13-17-review-2026-10-19.md)
+and [shared remaining checklist](ignis-11-13-17-completion-checklist.md). Earlier
+missing-code statements are historical. Hosted qualification, reviewed contract
+release/pins and #11 positive repair remain open; local mock proof does not close
+those gates.
