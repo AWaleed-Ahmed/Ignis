@@ -50,6 +50,12 @@ Local qualification: 441 agent passes / 4 skips, 86 dispatch, 82 Rust,
 open for the owned system-attribute and complete blob/hash matrix; CLN-08 needs
 an authenticated HTTP clone. LSE-11/14/16/18 retain broader and hosted controls.
 
+**2026-10-19 correction:** the recheck's timeout cleanup, terminal replay and
+architecture-log findings are resolved. Fresh results are agent441/4skip,
+dispatch88, Rust86, contracts19, harness31, matrix36 and paired3. LSE-09 and ALL-02
+are locally satisfied; broader hosted/release controls stay open. See
+[the correction record](result-delivery-fix-review-2026-10-19.md).
+
 ## 1. Shared completion rules
 
 - [ ] ALL-01 Record full Raphael and Ignis SHAs, Git/tool versions, backend, fixture SHAs, configuration, and contract version for every qualification run.

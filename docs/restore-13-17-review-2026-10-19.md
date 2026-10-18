@@ -1,5 +1,13 @@
 # Recovery implementation and verification: #13 / #17
 
+**Correction delivered:** the findings in the recheck were fixed and freshly
+verified; see [the correction record](result-delivery-fix-review-2026-10-19.md).
+Historical observations and failures below are retained for review.
+
+**Subsequent verification:** [the fresh recheck](restore-13-17-recheck-2026-10-19.md)
+found result-delivery cleanup and terminal replay gaps. Its changes-requested
+verdict supersedes the zero-findings conclusion below until fixed.
+
 Started 2026-10-18; updated 2026-10-19. Branch in both repositories:
 `fix/restore-clone-leases`. [Recovery plan](restore-13-17-plan-2026-10-18.md).
 
