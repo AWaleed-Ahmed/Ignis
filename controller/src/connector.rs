@@ -1099,67 +1099,101 @@ where
                         "{}/v1/results",
                         self.config.dispatch_url.trim_end_matches('/')
                     );
-                    let body = loop {
-                        let budget = deadline
-                            .remaining()
-                            .map_err(|e| ConnectorError::Timeout(e.to_string()))?;
-                        let exchange = async {
-                            let response = client
-                                .post(&url)
-                                .bearer_auth(&self.config.token)
-                                .json(&result)
-                                .timeout(budget.min(self.config.http_timeout))
-                                .send()
-                                .await
-                                .map_err(controller_http_error)?;
-                            let status = response.status();
-                            let body: Value =
-                                response.json().await.map_err(controller_http_error)?;
-                            Ok::<_, ConnectorError>((status, body))
-                        };
-                        let (status, body) = if let Some(heartbeat) = &_heartbeat {
-                            tokio::select! {
-                                response = exchange => response?,
-                                _ = heartbeat.lost() => {
-                                    self.handle_terminal(Terminal { job_id: job_id.clone(), final_status: "failed".into(), instructions: "discard_local_copy".into() }).await?;
-                                    return Err(ConnectorError::LeaseExpired(job_id.clone()));
+                    let delivery = async {
+                        let mut failures = 0;
+                        loop {
+                            let budget = deadline
+                                .remaining()
+                                .map_err(|e| ConnectorError::Timeout(e.to_string()))?;
+                            let exchange = async {
+                                let response = client
+                                    .post(&url)
+                                    .bearer_auth(&self.config.token)
+                                    .json(&result)
+                                    .timeout(budget.min(self.config.http_timeout))
+                                    .send()
+                                    .await
+                                    .map_err(controller_http_error)?;
+                                let status = response.status();
+                                // Error responses need not have a JSON body.
+                                if !status.is_success() {
+                                    return Ok((status, Value::Null));
+                                }
+                                let body = response
+                                    .json::<Value>()
+                                    .await
+                                    .map_err(controller_http_error)?;
+                                Ok::<_, ConnectorError>((status, body))
+                            };
+                            let error = match exchange.await {
+                                Ok((status, body)) if status.is_success() => {
+                                    let next_claim = body
+                                        .get("claim")
+                                        .cloned()
+                                        .map(serde_json::from_value::<LeaseClaim>)
+                                        .transpose()
+                                        .map_err(|e| {
+                                            ConnectorError::Malformed(format!(
+                                                "invalid lease claim: {e}"
+                                            ))
+                                        })?;
+                                    let messages = body
+                                        .get("messages")
+                                        .and_then(Value::as_array)
+                                        .ok_or_else(|| {
+                                            ConnectorError::Malformed(
+                                                "result response missing messages array".into(),
+                                            )
+                                        })?
+                                        .clone();
+                                    return Ok((next_claim, messages));
+                                }
+                                Ok((reqwest::StatusCode::CONFLICT, _)) => None,
+                                Ok((status, _)) => {
+                                    let error = ConnectorError::Execution(format!(
+                                        "dispatch returned {status}"
+                                    ));
+                                    if !status.is_server_error() && status.as_u16() != 429 {
+                                        return Err(error);
+                                    }
+                                    Some(error)
+                                }
+                                Err(error) => Some(error),
+                            };
+                            if let Some(error) = error {
+                                failures += 1;
+                                if failures >= 3 {
+                                    return Err(error);
                                 }
                             }
-                        } else {
-                            exchange.await?
-                        };
-                        if status != reqwest::StatusCode::CONFLICT {
-                            if !status.is_success() {
-                                return Err(ConnectorError::Execution(format!(
-                                    "dispatch returned {status}"
-                                )));
-                            }
-                            break body;
-                        }
-                        // Dispatch is processing the identical result. Keep its lease alive.
-                        deadline
-                            .remaining()
-                            .map_err(|e| ConnectorError::Timeout(e.to_string()))?;
-                        if let Some(heartbeat) = &_heartbeat {
-                            tokio::select! {
-                                _ = sleep(self.config.polling_interval.min(budget)) => {},
-                                _ = heartbeat.lost() => {
-                                    self.handle_terminal(Terminal { job_id: job_id.clone(), final_status: "failed".into(), instructions: "discard_local_copy".into() }).await?;
-                                    return Err(ConnectorError::LeaseExpired(job_id.clone()));
-                                }
-                            }
-                        } else {
-                            sleep(self.config.polling_interval.min(budget)).await;
+                            // Retry the cached result, never execute the action again.
+                            let remaining = deadline
+                                .remaining()
+                                .map_err(|e| ConnectorError::Timeout(e.to_string()))?;
+                            sleep(self.config.polling_interval.min(remaining)).await;
                         }
                     };
-                    *claim = body
-                        .get("claim")
-                        .cloned()
-                        .map(serde_json::from_value::<LeaseClaim>)
-                        .transpose()
-                        .map_err(|e| {
-                            ConnectorError::Malformed(format!("invalid lease claim: {e}"))
-                        })?;
+                    let delivered = if let Some(heartbeat) = &_heartbeat {
+                        tokio::select! {
+                            response = delivery => response,
+                            _ = heartbeat.lost() => Err(ConnectorError::LeaseExpired(job_id.clone())),
+                        }
+                    } else {
+                        delivery.await
+                    };
+                    let (next_claim, messages) = match delivered {
+                        Ok(response) => response,
+                        Err(error) => {
+                            self.handle_terminal(Terminal {
+                                job_id: job_id.clone(),
+                                final_status: "failed".into(),
+                                instructions: "discard_local_copy".into(),
+                            })
+                            .await?;
+                            return Err(error);
+                        }
+                    };
+                    *claim = next_claim;
                     if let (Some(heartbeat), Some(next_claim)) = (&_heartbeat, claim.as_mut()) {
                         let confirmed = heartbeat.confirmed.lock().await;
                         if confirmed.action_id == next_claim.action_id
@@ -1169,15 +1203,7 @@ where
                             *next_claim = confirmed.clone();
                         }
                     }
-                    let next = body
-                        .get("messages")
-                        .and_then(Value::as_array)
-                        .ok_or_else(|| {
-                            ConnectorError::Malformed(
-                                "result response missing messages array".into(),
-                            )
-                        })?;
-                    pending.extend(next.iter().cloned());
+                    pending.extend(messages);
                 }
                 "terminal" => {
                     let terminal: Terminal = serde_json::from_value(envelope.payload)
@@ -2328,6 +2354,7 @@ mod tests {
     struct FakeExecutor {
         calls: Arc<Mutex<Vec<String>>>,
         destroyed: Arc<Mutex<usize>>,
+        fail_destroy: Arc<AtomicBool>,
     }
 
     #[derive(Clone)]
@@ -2387,6 +2414,11 @@ mod tests {
         }
         async fn destroy(&self, _local: &LocalJob) -> Result<(), ConnectorError> {
             *self.destroyed.lock().await += 1;
+            if self.fail_destroy.load(Ordering::SeqCst) {
+                return Err(ConnectorError::Execution(
+                    "synthetic destroy failure".into(),
+                ));
+            }
             Ok(())
         }
     }
@@ -3022,5 +3054,141 @@ mod tests {
         assert!(matches!(error, ConnectorError::Execution(_)));
         assert!(started.elapsed() < Duration::from_millis(150));
         server.await.unwrap();
+    }
+    async fn check_result_delivery_cleanup(mode: &str, fail_cleanup: bool) {
+        use axum::{
+            body::{Body, Bytes},
+            response::Response,
+            routing::post,
+            Router,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let terminal_job = Arc::new(Mutex::new(String::new()));
+        let route_attempts = attempts.clone();
+        let route_requests = requests.clone();
+        let route_job = terminal_job.clone();
+        let route_mode = mode.to_string();
+        let app = Router::new().route("/v1/results", post(move |axum::Json(body): axum::Json<Value>| {
+            let attempts = route_attempts.clone();
+            let requests = route_requests.clone();
+            let job = route_job.clone();
+            let mode = route_mode.clone();
+            async move {
+                requests.lock().await.push(body);
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                if mode == "retry" && attempt > 0 {
+                    let job_id = job.lock().await.clone();
+                    return Response::builder().header("content-type", "application/json")
+                        .body(Body::from(json!({"messages":[envelope("terminal", Some(job_id.clone()), json!({"job_id":job_id,"final_status":"failed","instructions":"discard_local_copy"}))],"idempotent_replay":true}).to_string())).unwrap();
+                }
+                if mode == "budget" {
+                    return Response::builder().status(409).header("content-type", "application/json")
+                        .body(Body::from("{}" )).unwrap();
+                }
+                Response::builder().header("content-type", "application/json")
+                    .body(Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>())).unwrap()
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let directory = tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let journal = directory.path().join("recovery");
+        let mut settings = config();
+        settings.dispatch_url = format!("http://{address}");
+        settings.http_timeout = Duration::from_millis(30);
+        let executor = FakeExecutor::default();
+        executor.fail_destroy.store(fail_cleanup, Ordering::SeqCst);
+        let connector = Connector::with_recovery(
+            settings.clone(),
+            executor.clone(),
+            FakeCloner {
+                workspace: workspace.clone(),
+            },
+            Arc::new(RecoveryStore::open(&journal).unwrap()),
+        );
+        let job = job();
+        let job_id = job.job_id.clone();
+        *terminal_job.lock().await = job_id.clone();
+        connector.handle_job(job, "run", "connector").await.unwrap();
+        let action_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let action_budget = if mode == "budget" {
+            chrono::Duration::milliseconds(72_150)
+        } else {
+            chrono::Duration::seconds(200)
+        };
+        let mut claim = Some(LeaseClaim {
+            job_id: job_id.clone(),
+            claim_id: Uuid::new_v4().to_string(),
+            action_id: action_id.clone(),
+            renewal_sequence: 0,
+            lease_ttl_seconds: 30,
+            lease_expires_at: now + chrono::Duration::seconds(30),
+            action_deadline_at: now + action_budget,
+            job_deadline_at: now + chrono::Duration::seconds(300),
+        });
+        let message = action(&job_id, &action_id, "observe_failure", json!({}));
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            connector.process_http_message(&Client::new(), &message, &mut claim),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        assert_eq!(result.is_ok(), mode == "retry");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!workspace.exists(), "delivery failure abandoned workspace");
+        assert_eq!(*executor.destroyed.lock().await, 1);
+        let delivered = requests.lock().await;
+        assert!(delivered.len() > 1, "transient failure was not retried");
+        assert!(
+            delivered.iter().all(|body| body == &delivered[0]),
+            "retry changed cached result"
+        );
+        assert_eq!(
+            executor.calls.lock().await.len(),
+            1,
+            "retry reexecuted action"
+        );
+        if fail_cleanup {
+            let record = connector.recovery.job(&job_id).unwrap();
+            assert!(record.terminal && record.cleanup_failed);
+            executor.fail_destroy.store(false, Ordering::SeqCst);
+            let restarted = Connector::with_recovery(
+                settings,
+                executor.clone(),
+                FakeCloner { workspace },
+                Arc::new(RecoveryStore::open(&journal).unwrap()),
+            );
+            restarted.rehydrate().await.unwrap();
+            assert!(restarted.recovery.job(&job_id).is_none());
+            assert_eq!(*executor.destroyed.lock().await, 2);
+        } else {
+            assert!(connector.recovery.job(&job_id).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn result_delivery_timeout_cleans_workspace_and_journal() {
+        check_result_delivery_cleanup("timeout", false).await;
+    }
+
+    #[tokio::test]
+    async fn result_delivery_retries_cached_result_and_recovers_terminal() {
+        check_result_delivery_cleanup("retry", false).await;
+    }
+
+    #[tokio::test]
+    async fn result_delivery_processing_conflicts_end_at_budget_and_clean_up() {
+        check_result_delivery_cleanup("budget", false).await;
+    }
+
+    #[tokio::test]
+    async fn result_delivery_failed_cleanup_is_retried_after_restart() {
+        check_result_delivery_cleanup("timeout", true).await;
     }
 }
