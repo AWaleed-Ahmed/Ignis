@@ -143,6 +143,16 @@ impl LeaseHeartbeat {
 }
 
 fn claim_deadline(claim: &LeaseClaim) -> Result<crate::deadline::Deadline, ConnectorError> {
+    if claim.lease_ttl_seconds == 0
+        || [&claim.job_id, &claim.action_id, &claim.claim_id]
+            .iter()
+            .any(|id| Uuid::parse_str(id).is_err())
+        || claim.lease_expires_at > claim.action_deadline_at.min(claim.job_deadline_at)
+    {
+        return Err(ConnectorError::Malformed(
+            "invalid lease claim bounds or identity".into(),
+        ));
+    }
     if Utc::now() >= claim.lease_expires_at {
         return Err(ConnectorError::LeaseExpired(claim.job_id.clone()));
     }
@@ -936,6 +946,13 @@ where
                 "action" => {
                     let action: Action = serde_json::from_value(envelope.payload)
                         .map_err(|e| ConnectorError::Malformed(e.to_string()))?;
+                    if claim.as_ref().is_some_and(|claim| {
+                        claim.action_id != action.action_id || claim.job_id != action.job_id
+                    }) {
+                        return Err(ConnectorError::Malformed(
+                            "claim does not match the action".into(),
+                        ));
+                    }
                     let lease_failed = Arc::new(AtomicBool::new(false));
                     let active_claim = claim
                         .as_ref()
@@ -2229,6 +2246,34 @@ mod tests {
             .await
             .unwrap();
         assert!(failed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn mismatched_claim_never_executes_as_legacy_unclaimed_work() {
+        let directory = tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let executor = FakeExecutor::default();
+        let connector =
+            Connector::with_cloner(config(), executor.clone(), FakeCloner { workspace });
+        let job_id = Uuid::new_v4().to_string();
+        let action_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let mut claim = Some(LeaseClaim {
+            job_id: Uuid::new_v4().to_string(),
+            claim_id: Uuid::new_v4().to_string(),
+            action_id: action_id.clone(),
+            renewal_sequence: 0,
+            lease_ttl_seconds: 30,
+            lease_expires_at: now + chrono::Duration::seconds(30),
+            action_deadline_at: now + chrono::Duration::seconds(200),
+            job_deadline_at: now + chrono::Duration::seconds(300),
+        });
+        let message = action(&job_id, &action_id, "observe_failure", json!({}));
+        let result = connector
+            .process_http_message(&Client::new(), &message, &mut claim)
+            .await;
+        assert!(matches!(result, Err(ConnectorError::Malformed(_))));
+        assert!(executor.calls.lock().await.is_empty());
     }
 
     #[test]
