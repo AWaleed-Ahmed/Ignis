@@ -1,3 +1,4 @@
+pub mod image_pull;
 pub mod signatures;
 
 #[cfg(test)]

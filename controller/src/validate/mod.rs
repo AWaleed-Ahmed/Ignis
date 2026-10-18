@@ -15,6 +15,7 @@ pub async fn run_validation(
     before_signature: Option<&FailureSignature>,
     after_signature: Option<&FailureSignature>,
     fidelity: Option<&crate::domain::models::FidelityReport>,
+    deadline: crate::deadline::Deadline,
 ) -> Result<ValidationResults, DomainError> {
     let mut checks = Vec::new();
     let mut fail_closed = false;
@@ -22,8 +23,9 @@ pub async fn run_validation(
 
     if let Some(commands) = &plan.commands {
         for cmd in commands {
+            deadline.remaining()?;
             let start = Instant::now();
-            match run_static_command(workspace, cmd) {
+            match run_static_command(workspace, cmd, deadline).await {
                 Ok((code, message)) => {
                     let status = if code == 0 { "passed" } else { "failed" };
                     if code != 0 {
@@ -76,15 +78,23 @@ pub async fn run_validation(
 
     if let Some(health_checks) = &plan.health_checks {
         for hc in health_checks {
+            deadline.remaining()?;
             let start = Instant::now();
-            let timeout = Duration::from_secs(hc.timeout_seconds.unwrap_or(90) as u64);
+            let timeout =
+                deadline.cap(Duration::from_secs(hc.timeout_seconds.unwrap_or(90) as u64))?;
             match hc.check_type.as_str() {
                 "rollout" => {
                     let resource = hc
                         .resource
                         .clone()
                         .unwrap_or_else(|| "deployment/demo".into());
-                    match backend.check_rollout(namespace, &resource, timeout).await {
+                    match tokio::time::timeout(
+                        timeout,
+                        backend.check_rollout(namespace, &resource, timeout),
+                    )
+                    .await
+                    .map_err(|_| DomainError::Timeout("validation deadline exhausted".into()))?
+                    {
                         Ok(status) => {
                             if !status.ready {
                                 failed = true;
@@ -137,9 +147,12 @@ pub async fn run_validation(
                 "http" => {
                     let url = hc.url.clone().unwrap_or_default();
                     let expected = hc.expected_status.unwrap_or(200);
-                    match backend
-                        .http_health(namespace, &url, expected, timeout)
-                        .await
+                    match tokio::time::timeout(
+                        timeout,
+                        backend.http_health(namespace, &url, expected, timeout),
+                    )
+                    .await
+                    .map_err(|_| DomainError::Timeout("validation deadline exhausted".into()))?
                     {
                         Ok(result) => {
                             if !result.ok {
@@ -278,6 +291,7 @@ pub async fn run_validation(
         });
     }
 
+    deadline.remaining()?;
     let checks_passed = !failed && !fail_closed;
     Ok(ValidationResults {
         sandbox_id: sandbox_id.to_string(),
@@ -293,7 +307,11 @@ pub async fn run_validation(
     })
 }
 
-fn run_static_command(workspace: Option<&str>, cmd: &str) -> Result<(i32, String), DomainError> {
+async fn run_static_command(
+    workspace: Option<&str>,
+    cmd: &str,
+    deadline: crate::deadline::Deadline,
+) -> Result<(i32, String), DomainError> {
     // Allowlisted static validators only — no arbitrary shell for agent safety.
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     if parts.is_empty() {
@@ -317,14 +335,20 @@ fn run_static_command(workspace: Option<&str>, cmd: &str) -> Result<(i32, String
         )));
     }
 
-    let mut command = std::process::Command::new(bin);
+    let mut command = tokio::process::Command::new(bin);
     command.args(&parts[1..]);
     if let Some(ws) = workspace {
         command.current_dir(Path::new(ws));
     }
-    let output = command
-        .output()
-        .map_err(|e| DomainError::ValidationUnavailable(e.to_string()))?;
+    let output = crate::process::output_async(&mut command, deadline.remaining()?)
+        .await
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                DomainError::Timeout("validation command deadline exhausted".into())
+            } else {
+                DomainError::ValidationUnavailable(e.to_string())
+            }
+        })?;
     let code = output.status.code().unwrap_or(1);
     let mut message = String::from_utf8_lossy(&output.stdout).to_string();
     if message.trim().is_empty() {
@@ -371,6 +395,7 @@ mod fidelity_tests {
             None,
             None,
             Some(&fidelity),
+            crate::deadline::Deadline::new(std::time::Duration::from_secs(300)),
         )
         .await
         .unwrap();
@@ -388,6 +413,7 @@ mod fidelity_tests {
             None,
             None,
             Some(&fidelity),
+            crate::deadline::Deadline::new(std::time::Duration::from_secs(300)),
         )
         .await
         .unwrap();
@@ -403,5 +429,33 @@ mod fidelity_tests {
                     .as_deref()
                     .unwrap()
                     .contains("tags only: busybox:1.37.0")));
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    #[tokio::test]
+    async fn stalled_static_commands_share_one_budget_and_are_killed() {
+        let backend = crate::k8s::mock::MockCluster::new();
+        let plan: ValidationPlan = serde_json::from_value(serde_json::json!({
+            "commands": ["python3 -c __import__('time').sleep(2)", "python3 -c __import__('time').sleep(2)"],
+            "health_checks": []
+        })).unwrap();
+        let start = Instant::now();
+        let result = run_validation(
+            &backend,
+            "sb",
+            "ns",
+            None,
+            &plan,
+            None,
+            None,
+            None,
+            crate::deadline::Deadline::new(Duration::from_millis(50)),
+        )
+        .await;
+        assert!(matches!(result, Err(DomainError::Timeout(_))));
+        assert!(start.elapsed() < Duration::from_millis(500));
     }
 }
