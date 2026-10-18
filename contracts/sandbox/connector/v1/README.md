@@ -68,3 +68,20 @@ behind the controller's sandbox operation lock, and retried from the journal if
 it fails. This is a finite server-deadline guarantee; dropping a client request
 alone is not a server cancellation signal. Use a compatible released controller;
 older controllers may ignore the new header.
+
+### Result delivery and claim handover
+
+An old heartbeat can arrive after dispatch commits a result but before its
+HTTP response reaches the connector. Renewal still returns HTTP409. If the
+request matches a persisted completed action/claim and the same authenticated
+owner, the response includes `code: action_completed` plus the already-active
+next claim. Neither expiry nor sequence is extended by this response. Wrong
+claims/owners and expired/terminal jobs receive no handover credentials. The
+connector adopts and renews that confirmed claim while finishing result
+delivery, and keeps its latest sequence if the delayed result body contains
+an older snapshot. Unknown409 responses still mean lease loss.
+
+The entire result exchange, including response-body decoding, is selected
+against lease loss and bounded by its execution/transport budget. Failed
+preparation is journaled for cleanup; missing preparation workspaces at
+restart are cleaned safely rather than preventing other jobs from recovering.

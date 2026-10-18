@@ -60,7 +60,7 @@ paths:
           format: uuid
     post:
       operationId: renewConnectorLease
-      description: Equal sequence is idempotent. Renewal never moves the action or job deadline; expired, superseded and terminal claims cannot renew.
+      description: Equal sequence is idempotent. Renewal never moves the action or job deadline; expired, superseded and terminal claims cannot renew. A completed action may return HTTP409 with code action_completed and the already-active next claim to its original owner; this does not renew or extend either claim.
       requestBody:
         required: true
         content:
@@ -151,3 +151,10 @@ components:
                 const: false
               error:
                 type: string
+              code:
+                const: action_completed
+              claim:
+                $ref: './lease-claim.schema.json'
+            dependentRequired:
+              code: [claim]
+              claim: [code]
