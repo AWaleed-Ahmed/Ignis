@@ -3,6 +3,7 @@
 
 use std::io;
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 struct ProcessGroup(u32);
@@ -19,6 +20,14 @@ impl Drop for ProcessGroup {
 }
 
 pub fn output(command: &mut Command, budget: Duration) -> io::Result<Output> {
+    output_with_cancel(command, budget, None)
+}
+
+pub fn output_with_cancel(
+    command: &mut Command,
+    budget: Duration,
+    cancelled: Option<&AtomicBool>,
+) -> io::Result<Output> {
     if budget.is_zero() {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -40,6 +49,15 @@ pub fn output(command: &mut Command, budget: Duration) -> io::Result<Output> {
     let mut child = command.spawn()?;
     let group = ProcessGroup(child.id());
     let status = loop {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            drop(group);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "tool execution cancelled",
+            ));
+        }
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => {
@@ -127,4 +145,28 @@ pub async fn output_async(
         stdout: out,
         stderr: err,
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn cancellation_kills_owned_process_group() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        let worker = thread::spawn(move || {
+            output_with_cancel(
+                Command::new("sh").args(["-c", "sleep 30"]),
+                Duration::from_secs(60),
+                Some(&worker_cancelled),
+            )
+        });
+        thread::sleep(Duration::from_millis(50));
+        cancelled.store(true, Ordering::SeqCst);
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
 }
