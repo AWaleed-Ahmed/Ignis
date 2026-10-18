@@ -431,3 +431,31 @@ mod fidelity_tests {
                     .contains("tags only: busybox:1.37.0")));
     }
 }
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    #[tokio::test]
+    async fn stalled_static_commands_share_one_budget_and_are_killed() {
+        let backend = crate::k8s::mock::MockCluster::new();
+        let plan: ValidationPlan = serde_json::from_value(serde_json::json!({
+            "commands": ["python3 -c __import__('time').sleep(2)", "python3 -c __import__('time').sleep(2)"],
+            "health_checks": []
+        })).unwrap();
+        let start = Instant::now();
+        let result = run_validation(
+            &backend,
+            "sb",
+            "ns",
+            None,
+            &plan,
+            None,
+            None,
+            None,
+            crate::deadline::Deadline::new(Duration::from_millis(50)),
+        )
+        .await;
+        assert!(matches!(result, Err(DomainError::Timeout(_))));
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+}

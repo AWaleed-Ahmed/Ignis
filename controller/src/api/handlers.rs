@@ -253,3 +253,27 @@ impl IntoResponse for ApiError {
         (status, Json(body)).into_response()
     }
 }
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn server_deadline_cancels_before_late_state_update() {
+        let completed = AtomicBool::new(false);
+        let work = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            completed.store(true, Ordering::SeqCst);
+            Ok(())
+        };
+        let result = execute_bounded(
+            Some(crate::deadline::Deadline::new(Duration::from_millis(10))),
+            work,
+        )
+        .await;
+        assert!(matches!(result, Err(DomainError::Timeout(_))));
+        assert!(!completed.load(Ordering::SeqCst));
+    }
+}
