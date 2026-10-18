@@ -44,9 +44,9 @@ fn clone_at_sha_internal(
     if clone_url.trim().is_empty() {
         return Err(DomainError::InvalidRequest("clone_url is empty".into()));
     }
-    if commit_sha.len() < 7 {
+    if !(7..=40).contains(&commit_sha.len()) || !commit_sha.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(DomainError::InvalidRequest(
-            "commit_sha must be at least 7 characters".into(),
+            "commit_sha must be 7..40 hexadecimal characters".into(),
         ));
     }
 
@@ -130,11 +130,7 @@ fn clone_at_sha_internal(
         )));
     }
     let head = stdout.trim();
-    let prefix_len = 7.min(commit_sha.len()).min(head.len());
-    if !head.starts_with(commit_sha)
-        && !commit_sha.starts_with(&head[..prefix_len])
-        && !head.starts_with(&commit_sha[..prefix_len])
-    {
+    if !head.starts_with(&commit_sha.to_ascii_lowercase()) {
         return Err(DomainError::Internal(format!(
             "checked out HEAD {head} does not match requested {commit_sha}"
         )));
@@ -267,6 +263,21 @@ mod tests {
     }
 
     #[test]
+    fn rejects_refs_and_option_like_commit_values() {
+        for value in [
+            "--upload-pack=tool",
+            "main~123",
+            "123456g",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(matches!(
+                clone_at_sha("https://example.com/repo.git", value),
+                Err(DomainError::InvalidRequest(_))
+            ));
+        }
+    }
+
+    #[test]
     fn rejects_short_sha() {
         let err = clone_at_sha("https://example.com/repo.git", "abc").unwrap_err();
         assert!(err.to_string().contains("commit_sha"));
@@ -275,7 +286,7 @@ mod tests {
     #[test]
     fn checkout_policy_preserves_repository_attributes_and_binary_bytes() {
         let source = tempfile::tempdir().unwrap();
-        git(source.path(), &["init"]);
+        git(source.path(), &["init", "--template="]);
         git(source.path(), &["config", "user.email", "test@example.com"]);
         git(source.path(), &["config", "user.name", "Test"]);
         git(source.path(), &["config", "core.autocrlf", "true"]);
@@ -296,6 +307,24 @@ mod tests {
         fs::write(source.path().join("nested/lf.txt"), b"one\r\ntwo\n").unwrap();
         fs::write(source.path().join("binary.bin"), b"one\r\ntwo\0\n").unwrap();
         git(source.path(), &["add", "."]);
+        fs::write(
+            source.path().join("authored-crlf.txt"),
+            b"original\r\nbytes\r\n",
+        )
+        .unwrap();
+        fs::write(source.path().join("unicode.txt"), "café\n").unwrap();
+        fs::write(source.path().join("no-newline.txt"), "no final newline").unwrap();
+        git(
+            source.path(),
+            &[
+                "-c",
+                "core.autocrlf=false",
+                "add",
+                "authored-crlf.txt",
+                "unicode.txt",
+                "no-newline.txt",
+            ],
+        );
         git(source.path(), &["commit", "-m", "fixture"]);
         let sha = String::from_utf8(
             Command::new("git")
@@ -330,6 +359,7 @@ mod tests {
             fs::read(workspace.join("binary.bin")).unwrap(),
             b"one\r\ntwo\0\n"
         );
+        assert_additional_bytes(&workspace);
         assert_minimal_patch(&workspace);
         fs::remove_dir_all(workspace).unwrap();
 
@@ -361,8 +391,24 @@ mod tests {
             fs::read(fallback.path().join("binary.bin")).unwrap(),
             b"one\r\ntwo\0\n"
         );
+        assert_additional_bytes(fallback.path());
         assert_minimal_patch(fallback.path());
         drop(fallback);
+    }
+
+    fn assert_additional_bytes(workspace: &Path) {
+        assert_eq!(
+            fs::read(workspace.join("authored-crlf.txt")).unwrap(),
+            b"original\r\nbytes\r\n"
+        );
+        assert_eq!(
+            fs::read(workspace.join("unicode.txt")).unwrap(),
+            "café\n".as_bytes()
+        );
+        assert_eq!(
+            fs::read(workspace.join("no-newline.txt")).unwrap(),
+            b"no final newline"
+        );
     }
 
     fn assert_minimal_patch(workspace: &Path) {
