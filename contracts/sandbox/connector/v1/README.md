@@ -13,6 +13,8 @@ Public wire schemas for the persistent outbound connection between a customer-ho
 | `terminal.schema.json` | dispatch → connector | Ends a job and instructs the connector to discard local state |
 | `ack.schema.json` | both | Receipt confirmation independent of action success or failure |
 | `error.schema.json` | both | Protocol or connection-level failure outside the normal action/result flow |
+| `lease-renewal-request.schema.json` | connector → dispatch | Monotonic renewal request for the active action claim |
+| `lease-claim.schema.json` | dispatch → connector | Claim and absolute job/action deadlines returned by polling or renewal |
 
 ## Design rules
 
@@ -40,3 +42,29 @@ The `job_lease_expired` error code assumes that private dispatch tracks job leas
 ## Versioning
 
 This is protocol `v1`. A breaking change to the envelope or payload shapes requires a new `v2/` directory rather than an in-place edit. `raphael-core` must pin a released connector-contract version.
+
+
+## HTTP transport and execution deadlines
+
+`http.openapi.yaml` defines polling, result transition responses, and authenticated
+lease renewal. Claims are credentials; never include them in public evidence or
+application logs. An identical result already being processed returns HTTP 409;
+the connector retries its cached result while keeping the heartbeat running.
+The endpoint additions do not change the seven existing
+connector envelope/payload schemas.
+
+The connector sends the optional RFC3339 `x-raphael-action-deadline-at` header
+to controller execution endpoints (create, deploy, observe, validate, finalize).
+A compatible controller checks it before execution, bounds the server future,
+and rejects an expired operation with HTTP 504. Validation carries one remaining
+budget through lock acquisition, observation, tool collection, static commands,
+health checks, and its final registry update. An expired execution does not save
+a success receipt. Malformed deadline headers return HTTP 400.
+
+The connector reserves 72 seconds from the fixed job/action deadline: 70 seconds
+for the bounded destroy RPC and two seconds for transport/report work. It refuses
+new execution when that reserve cannot fit. Cleanup is journaled, serialized
+behind the controller's sandbox operation lock, and retried from the journal if
+it fails. This is a finite server-deadline guarantee; dropping a client request
+alone is not a server cancellation signal. Use a compatible released controller;
+older controllers may ignore the new header.

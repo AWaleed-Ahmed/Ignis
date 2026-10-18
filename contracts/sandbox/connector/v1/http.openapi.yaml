@@ -1,0 +1,153 @@
+openapi: 3.1.0
+info:
+  title: Connector dispatch HTTP API
+  version: '1.0'
+  description: Candidate additive HTTP contracts; release through Ignis before updating the consumer pin.
+security:
+  - connectorBearer: []
+paths:
+  /v1/tenants/{tenant_id}/jobs/next:
+    parameters:
+      - $ref: '#/components/parameters/Tenant'
+    get:
+      operationId: nextConnectorAction
+      description: Returns only an action owned by this authenticated connector identity. The claim is a credential.
+      responses:
+        '200':
+          description: Claimed action or empty queue
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [messages, pending]
+                properties:
+                  messages:
+                    type: array
+                    maxItems: 1
+                    items:
+                      $ref: './envelope.schema.json'
+                  pending:
+                    type: boolean
+                  claim:
+                    $ref: './lease-claim.schema.json'
+                allOf:
+                  - if:
+                      properties:
+                        pending:
+                          const: true
+                    then:
+                      required: [claim]
+                      properties:
+                        messages:
+                          minItems: 1
+                    else:
+                      properties:
+                        messages:
+                          maxItems: 0
+        '401':
+          $ref: '#/components/responses/Denied'
+        '403':
+          $ref: '#/components/responses/Denied'
+  /v1/tenants/{tenant_id}/jobs/{job_id}/lease:
+    parameters:
+      - $ref: '#/components/parameters/Tenant'
+      - name: job_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      operationId: renewConnectorLease
+      description: Equal sequence is idempotent. Renewal never moves the action or job deadline; expired, superseded and terminal claims cannot renew.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: './lease-renewal-request.schema.json'
+      responses:
+        '200':
+          description: Current confirmed lease
+          content:
+            application/json:
+              schema:
+                $ref: './lease-claim.schema.json'
+        '401':
+          $ref: '#/components/responses/Denied'
+        '403':
+          $ref: '#/components/responses/Denied'
+        '409':
+          $ref: '#/components/responses/Denied'
+        '422':
+          $ref: '#/components/responses/Denied'
+  /v1/results:
+    post:
+      operationId: acceptConnectorResult
+      description: Accept one result for the active owned action. Persist transition and lease checks atomically. Concurrent in-flight submissions return retryable HTTP 409; completed identical results are idempotent.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: './envelope.schema.json'
+                - properties:
+                    kind:
+                      const: result
+                    payload:
+                      $ref: './result.schema.json'
+      responses:
+        '200':
+          description: Next transition or idempotent replay
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [messages, idempotent_replay]
+                properties:
+                  messages:
+                    type: array
+                    items:
+                      $ref: './envelope.schema.json'
+                  idempotent_replay:
+                    type: boolean
+                  claim:
+                    $ref: './lease-claim.schema.json'
+        '401':
+          $ref: '#/components/responses/Denied'
+        '403':
+          $ref: '#/components/responses/Denied'
+        '409':
+          $ref: '#/components/responses/Denied'
+        '422':
+          $ref: '#/components/responses/Denied'
+components:
+  securitySchemes:
+    connectorBearer:
+      type: http
+      scheme: bearer
+  parameters:
+    Tenant:
+      name: tenant_id
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+  responses:
+    Denied:
+      description: Authentication, ownership, claim conflict, or input validation failure as indicated by status.
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [valid, error]
+            properties:
+              valid:
+                const: false
+              error:
+                type: string

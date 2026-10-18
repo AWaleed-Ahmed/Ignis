@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,16 +11,19 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use crate::gitclone::clone_at_sha;
+use crate::gitclone::clone_tempdir_at_sha_with_deadline_and_cancel;
 use crate::state::recovery::{ActionReceipt, ConnectorJobRecord, RecoveryStore};
 
 const PROTOCOL_VERSION: &str = "1.0";
 const MAX_RECONNECT_SECONDS: u64 = 30;
+// Match the bounded destroy RPC (70s), with 2s for transport/report work.
+const CLEANUP_HEADROOM_SECONDS: u64 = 72;
 const ALLOWED_VERBS: [&str; 6] = [
     "create_sandbox",
     "deploy_revision",
@@ -105,6 +109,167 @@ struct Envelope {
     kind: String,
     sent_at: String,
     payload: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LeaseClaim {
+    job_id: String,
+    claim_id: String,
+    action_id: String,
+    renewal_sequence: u64,
+    lease_ttl_seconds: u64,
+    action_deadline_at: DateTime<Utc>,
+    job_deadline_at: DateTime<Utc>,
+    lease_expires_at: DateTime<Utc>,
+}
+
+struct LeaseHeartbeat {
+    task: JoinHandle<()>,
+    failed: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl LeaseHeartbeat {
+    async fn lost(&self) {
+        loop {
+            if self.failed.load(Ordering::SeqCst) {
+                return;
+            }
+            self.notify.notified().await;
+        }
+    }
+}
+
+fn claim_deadline(claim: &LeaseClaim) -> Result<crate::deadline::Deadline, ConnectorError> {
+    if Utc::now() >= claim.lease_expires_at {
+        return Err(ConnectorError::LeaseExpired(claim.job_id.clone()));
+    }
+    let absolute = claim.action_deadline_at.min(claim.job_deadline_at);
+    let remaining = (absolute - Utc::now())
+        .to_std()
+        .map_err(|_| ConnectorError::LeaseExpired(claim.job_id.clone()))?;
+    if remaining.is_zero() {
+        return Err(ConnectorError::LeaseExpired(claim.job_id.clone()));
+    }
+    let execution = remaining
+        .checked_sub(Duration::from_secs(CLEANUP_HEADROOM_SECONDS))
+        .filter(|budget| !budget.is_zero())
+        .ok_or_else(|| ConnectorError::LeaseExpired(claim.job_id.clone()))?;
+    Ok(crate::deadline::Deadline::new(execution))
+}
+
+impl Drop for LeaseHeartbeat {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn start_lease_heartbeat(
+    client: Client,
+    config: ConnectorConfig,
+    mut claim: LeaseClaim,
+    failed: Arc<AtomicBool>,
+) -> LeaseHeartbeat {
+    let notify = Arc::new(Notify::new());
+    let task_notify = notify.clone();
+    let task_failed = failed.clone();
+    let task = tokio::spawn(async move {
+        let absolute_deadline = claim.action_deadline_at.min(claim.job_deadline_at);
+        let renewal_interval = Duration::from_secs((claim.lease_ttl_seconds / 3).max(1));
+        let mut sequence = claim.renewal_sequence;
+        loop {
+            let remaining = (absolute_deadline.min(claim.lease_expires_at) - Utc::now())
+                .to_std()
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                task_failed.store(true, Ordering::SeqCst);
+                task_notify.notify_one();
+                return;
+            }
+            let interval = renewal_interval.min(remaining / 3);
+            sleep(interval).await;
+            if Utc::now() >= absolute_deadline.min(claim.lease_expires_at) {
+                task_failed.store(true, Ordering::SeqCst);
+                task_notify.notify_one();
+                return;
+            }
+            sequence = sequence.saturating_add(1);
+            let url = format!(
+                "{}/v1/tenants/{}/jobs/{}/lease",
+                config.dispatch_url.trim_end_matches('/'),
+                config.tenant_id,
+                claim.job_id
+            );
+            let body = json!({
+                "action_id": claim.action_id,
+                "claim_id": claim.claim_id,
+                "renewal_sequence": sequence,
+            });
+            let mut renewed = false;
+            for attempt in 0..3 {
+                let remaining = (absolute_deadline.min(claim.lease_expires_at) - Utc::now())
+                    .to_std()
+                    .unwrap_or_default();
+                if remaining.is_zero() {
+                    break;
+                }
+                let response = client
+                    .post(&url)
+                    .bearer_auth(&config.token)
+                    .json(&body)
+                    .timeout(
+                        remaining.min(Duration::from_secs((claim.lease_ttl_seconds / 6).max(1))),
+                    )
+                    .send()
+                    .await;
+                match response {
+                    Ok(response) if response.status().is_success() => {
+                        match response.json::<LeaseClaim>().await {
+                            Ok(updated)
+                                if updated.job_id == claim.job_id
+                                    && updated.action_id == claim.action_id
+                                    && updated.claim_id == claim.claim_id
+                                    && updated.renewal_sequence == sequence
+                                    && updated.action_deadline_at == claim.action_deadline_at
+                                    && updated.job_deadline_at == claim.job_deadline_at
+                                    && updated.lease_expires_at > Utc::now()
+                                    && updated.lease_expires_at <= absolute_deadline =>
+                            {
+                                claim.lease_expires_at = updated.lease_expires_at;
+                                renewed = true;
+                            }
+                            _ => {}
+                        }
+                        break;
+                    }
+                    Ok(response)
+                        if !response.status().is_server_error()
+                            && response.status().as_u16() != 429 =>
+                    {
+                        break
+                    }
+                    _ => {}
+                }
+                let lease_remaining = (absolute_deadline.min(claim.lease_expires_at) - Utc::now())
+                    .to_std()
+                    .unwrap_or_default();
+                if attempt == 2 || lease_remaining.is_zero() || Utc::now() >= absolute_deadline {
+                    break;
+                }
+                sleep(Duration::from_millis(100 * (attempt + 1)).min(lease_remaining)).await;
+            }
+            if !renewed {
+                task_failed.store(true, Ordering::SeqCst);
+                task_notify.notify_one();
+                return;
+            }
+        }
+    });
+    LeaseHeartbeat {
+        task,
+        failed,
+        notify,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,7 +375,32 @@ pub enum ConnectorError {
 
 #[async_trait]
 pub trait WorkspaceCloner: Send + Sync {
-    async fn clone_job(&self, job: &Job) -> Result<PathBuf, ConnectorError>;
+    async fn clone_job(
+        &self,
+        job: &Job,
+        deadline: crate::deadline::Deadline,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<CloneWorkspace, ConnectorError>;
+}
+
+pub struct CloneWorkspace {
+    path: PathBuf,
+    guard: Option<tempfile::TempDir>,
+}
+
+impl CloneWorkspace {
+    fn owned(guard: tempfile::TempDir) -> Self {
+        Self {
+            path: guard.path().to_path_buf(),
+            guard: Some(guard),
+        }
+    }
+
+    fn keep(self) {
+        if let Some(guard) = self.guard {
+            let _ = guard.keep();
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -218,13 +408,45 @@ pub struct GitWorkspaceCloner;
 
 #[async_trait]
 impl WorkspaceCloner for GitWorkspaceCloner {
-    async fn clone_job(&self, job: &Job) -> Result<PathBuf, ConnectorError> {
+    async fn clone_job(
+        &self,
+        job: &Job,
+        deadline: crate::deadline::Deadline,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<CloneWorkspace, ConnectorError> {
         let clone_url = job.repository.clone_url.clone();
         let commit = job.commit_sha.clone();
-        tokio::task::spawn_blocking(move || clone_at_sha(&clone_url, &commit))
-            .await
-            .map_err(|e| ConnectorError::Execution(e.to_string()))?
-            .map_err(|e| ConnectorError::Execution(e.to_string()))
+        let worker_cancelled = cancelled.clone();
+        let mut cancellation_guard = CancelOnDrop {
+            cancelled,
+            armed: true,
+        };
+        let workspace = tokio::task::spawn_blocking(move || {
+            clone_tempdir_at_sha_with_deadline_and_cancel(
+                &clone_url,
+                &commit,
+                deadline,
+                &worker_cancelled,
+            )
+        })
+        .await
+        .map_err(|e| ConnectorError::Execution(e.to_string()))?
+        .map_err(|e| ConnectorError::Execution(e.to_string()))?;
+        cancellation_guard.armed = false;
+        Ok(CloneWorkspace::owned(workspace))
+    }
+}
+
+struct CancelOnDrop {
+    cancelled: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
     }
 }
 
@@ -235,6 +457,7 @@ pub trait ActionExecutor: Send + Sync {
         job: &Job,
         local: &LocalJob,
         action: &Action,
+        deadline: crate::deadline::Deadline,
     ) -> Result<Value, ConnectorError>;
 
     async fn destroy(&self, local: &LocalJob) -> Result<(), ConnectorError>;
@@ -269,6 +492,13 @@ impl ControllerExecutor {
             .client
             .post(format!("{}{}", self.base_url, path))
             .json(&body)
+            .header(
+                "x-raphael-action-deadline-at",
+                (Utc::now()
+                    + chrono::Duration::from_std(budget)
+                        .map_err(|e| ConnectorError::Malformed(e.to_string()))?)
+                .to_rfc3339(),
+            )
             .timeout(budget);
         if let Some(action_id) = action_id {
             request = request.header("x-raphael-connector-action-id", action_id);
@@ -297,6 +527,7 @@ impl ActionExecutor for ControllerExecutor {
         job: &Job,
         local: &LocalJob,
         action: &Action,
+        deadline: crate::deadline::Deadline,
     ) -> Result<Value, ConnectorError> {
         validate_action_args(&action.verb, &action.args)?;
         let sandbox_id = local.sandbox_id.as_deref();
@@ -305,7 +536,7 @@ impl ActionExecutor for ControllerExecutor {
                 "sandbox_id is not available".into(),
             ));
         }
-        let body = match action.verb.as_str() {
+        let mut body = match action.verb.as_str() {
             "create_sandbox" => action.args.clone(),
             "deploy_revision" => {
                 let mut object = action.args.as_object().cloned().ok_or_else(|| {
@@ -347,6 +578,13 @@ impl ActionExecutor for ControllerExecutor {
         } else {
             Duration::from_secs(300)
         };
+        let remaining = deadline
+            .remaining()
+            .map_err(|error| ConnectorError::Timeout(error.to_string()))?;
+        cap_action_timeouts(&action.verb, &mut body, remaining)?;
+        let budget = deadline
+            .cap(budget)
+            .map_err(|error| ConnectorError::Timeout(error.to_string()))?;
         let result = self
             .post(&path, body, Some(&action.action_id), budget)
             .await?;
@@ -370,6 +608,58 @@ impl ActionExecutor for ControllerExecutor {
             .await?;
         validate_response("destroy_sandbox", &result)
     }
+}
+
+fn cap_action_timeouts(
+    verb: &str,
+    body: &mut Value,
+    remaining: Duration,
+) -> Result<(), ConnectorError> {
+    let seconds = remaining.as_secs();
+    if seconds == 0 {
+        return Err(ConnectorError::Timeout(
+            "absolute action deadline exhausted".into(),
+        ));
+    }
+    let cap = |object: &mut serde_json::Map<String, Value>, key: &str, default: u64| {
+        let requested = object.get(key).and_then(Value::as_u64).unwrap_or(default);
+        object.insert(
+            key.to_string(),
+            Value::from(
+                requested
+                    .min(seconds)
+                    .max(if key == "wait_seconds" { 0 } else { 1 }),
+            ),
+        );
+    };
+    match verb {
+        "deploy_revision" => {
+            if let Some(object) = body.as_object_mut() {
+                cap(object, "deploy_timeout_seconds", 120);
+                cap(object, "wait_seconds", 60);
+            }
+        }
+        "observe_failure" => {
+            if let Some(object) = body.as_object_mut() {
+                cap(object, "timeout_seconds", 90);
+            }
+        }
+        "run_validation" => {
+            if let Some(plan) = body.get_mut("plan").and_then(Value::as_object_mut) {
+                for key in ["health_checks"] {
+                    if let Some(items) = plan.get_mut(key).and_then(Value::as_array_mut) {
+                        for item in items {
+                            if let Some(object) = item.as_object_mut() {
+                                cap(object, "timeout_seconds", 90);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub struct Connector<E = ControllerExecutor, C = GitWorkspaceCloner> {
@@ -555,8 +845,15 @@ where
             sleep(self.config.polling_interval).await;
             return Ok(());
         }
+        let mut claim = body
+            .get("claim")
+            .cloned()
+            .map(serde_json::from_value::<LeaseClaim>)
+            .transpose()
+            .map_err(|e| ConnectorError::Malformed(format!("invalid lease claim: {e}")))?;
         for message in messages {
-            self.process_http_message(&client, message).await?;
+            self.process_http_message(&client, message, &mut claim)
+                .await?;
         }
         Ok(())
     }
@@ -585,6 +882,7 @@ where
         &self,
         client: &Client,
         value: &Value,
+        claim: &mut Option<LeaseClaim>,
     ) -> Result<(), ConnectorError> {
         let mut pending = vec![value.clone()];
         while let Some(value) = pending.pop() {
@@ -593,6 +891,32 @@ where
                 "action" => {
                     let action: Action = serde_json::from_value(envelope.payload)
                         .map_err(|e| ConnectorError::Malformed(e.to_string()))?;
+                    let lease_failed = Arc::new(AtomicBool::new(false));
+                    let active_claim = claim
+                        .as_ref()
+                        .filter(|claim| claim.action_id == action.action_id);
+                    let deadline = match active_claim.map(claim_deadline).transpose() {
+                        Ok(deadline) => deadline.unwrap_or_else(|| {
+                            crate::deadline::Deadline::new(Duration::from_secs(300))
+                        }),
+                        Err(error) => {
+                            self.handle_terminal(Terminal {
+                                job_id: action.job_id.clone(),
+                                final_status: "failed".into(),
+                                instructions: "discard_local_copy".into(),
+                            })
+                            .await?;
+                            return Err(error);
+                        }
+                    };
+                    let _heartbeat = active_claim.cloned().map(|claim| {
+                        start_lease_heartbeat(
+                            client.clone(),
+                            self.config.clone(),
+                            claim.clone(),
+                            lease_failed.clone(),
+                        )
+                    });
                     let job_id = action.job_id.clone();
                     if action.verb == "create_sandbox" {
                         let args = action.args.as_object().ok_or_else(|| {
@@ -657,26 +981,93 @@ where
                                         "create_sandbox args missing tenant_id".into(),
                                     )
                                 })?;
-                        self.handle_job(job, run_id, tenant_id).await?;
+                        let clone_cancelled = Arc::new(AtomicBool::new(false));
+                        let job_result = if let Some(heartbeat) = &_heartbeat {
+                            tokio::select! {
+                                result = self.handle_job_until(job, run_id, tenant_id, deadline, clone_cancelled.clone()) => result,
+                                _ = heartbeat.lost() => Err(ConnectorError::LeaseExpired(job_id.clone())),
+                            }
+                        } else {
+                            self.handle_job_until(job, run_id, tenant_id, deadline, clone_cancelled)
+                                .await
+                        };
+                        if matches!(job_result, Err(ConnectorError::LeaseExpired(_))) {
+                            self.handle_terminal(Terminal {
+                                job_id: job_id.clone(),
+                                final_status: "failed".into(),
+                                instructions: "discard_local_copy".into(),
+                            })
+                            .await?;
+                        }
+                        job_result?;
                     }
-                    let frames = self.handle_action(action).await?;
+                    let action_result = if let Some(heartbeat) = &_heartbeat {
+                        tokio::select! {
+                            result = self.handle_action_until(action, deadline) => result,
+                            _ = heartbeat.lost() => Err(ConnectorError::LeaseExpired(job_id.clone())),
+                        }
+                    } else {
+                        self.handle_action_until(action, deadline).await
+                    };
+                    if matches!(action_result, Err(ConnectorError::LeaseExpired(_))) {
+                        self.handle_terminal(Terminal {
+                            job_id: job_id.clone(),
+                            final_status: "failed".into(),
+                            instructions: "discard_local_copy".into(),
+                        })
+                        .await?;
+                    }
+                    let frames = action_result?;
                     let result = frames
                         .into_iter()
                         .find_map(|frame| serde_json::from_str::<Value>(&frame).ok())
                         .ok_or_else(|| {
                             ConnectorError::Malformed("action produced no result".into())
                         })?;
+                    if lease_failed.load(Ordering::SeqCst) {
+                        return Err(ConnectorError::LeaseExpired(job_id));
+                    }
                     let url = format!(
                         "{}/v1/results",
                         self.config.dispatch_url.trim_end_matches('/')
                     );
-                    let response = client
-                        .post(url)
-                        .bearer_auth(&self.config.token)
-                        .json(&result)
-                        .send()
-                        .await
-                        .map_err(|e| ConnectorError::Execution(e.to_string()))?;
+                    let response = loop {
+                        let send = client
+                            .post(&url)
+                            .bearer_auth(&self.config.token)
+                            .json(&result)
+                            .send();
+                        let response = if let Some(heartbeat) = &_heartbeat {
+                            tokio::select! {
+                                response = send => response.map_err(|e| ConnectorError::Execution(e.to_string()))?,
+                                _ = heartbeat.lost() => {
+                                    self.handle_terminal(Terminal { job_id: job_id.clone(), final_status: "failed".into(), instructions: "discard_local_copy".into() }).await?;
+                                    return Err(ConnectorError::LeaseExpired(job_id.clone()));
+                                }
+                            }
+                        } else {
+                            send.await
+                                .map_err(|e| ConnectorError::Execution(e.to_string()))?
+                        };
+                        if response.status() != reqwest::StatusCode::CONFLICT {
+                            break response;
+                        }
+                        // Dispatch is processing the identical result. Keep its lease alive.
+                        deadline
+                            .remaining()
+                            .map_err(|e| ConnectorError::Timeout(e.to_string()))?;
+                        if let Some(heartbeat) = &_heartbeat {
+                            tokio::select! {
+                                _ = sleep(self.config.polling_interval) => {},
+                                _ = heartbeat.lost() => {
+                                    self.handle_terminal(Terminal { job_id: job_id.clone(), final_status: "failed".into(), instructions: "discard_local_copy".into() }).await?;
+                                    return Err(ConnectorError::LeaseExpired(job_id.clone()));
+                                }
+                            }
+                        } else {
+                            sleep(self.config.polling_interval).await;
+                        }
+                    };
                     if !response.status().is_success() {
                         return Err(ConnectorError::Execution(format!(
                             "dispatch returned {}",
@@ -687,6 +1078,14 @@ where
                         .json()
                         .await
                         .map_err(|e| ConnectorError::Malformed(e.to_string()))?;
+                    *claim = body
+                        .get("claim")
+                        .cloned()
+                        .map(serde_json::from_value::<LeaseClaim>)
+                        .transpose()
+                        .map_err(|e| {
+                            ConnectorError::Malformed(format!("invalid lease claim: {e}"))
+                        })?;
                     let next = body
                         .get("messages")
                         .and_then(Value::as_array)
@@ -708,11 +1107,30 @@ where
         Ok(())
     }
 
+    #[cfg(test)]
     async fn handle_job(
         &self,
         job: Job,
         run_id: &str,
         tenant_id: &str,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.handle_job_until(
+            job,
+            run_id,
+            tenant_id,
+            crate::deadline::Deadline::new(Duration::from_secs(180)),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    }
+
+    async fn handle_job_until(
+        &self,
+        job: Job,
+        run_id: &str,
+        tenant_id: &str,
+        deadline: crate::deadline::Deadline,
+        cancelled: Arc<AtomicBool>,
     ) -> Result<Vec<String>, ConnectorError> {
         validate_job(&job)?;
         let job_id = job.job_id.clone();
@@ -740,29 +1158,46 @@ where
                 updated_at: Utc::now(),
             })
             .map_err(ConnectorError::Execution)?;
-        let workspace = self.cloner.clone_job(&job).await?;
+        let workspace_guard = self.cloner.clone_job(&job, deadline, cancelled).await?;
+        let workspace_path = workspace_guard.path.clone();
         let mut record = self
             .recovery
             .job(&job_id)
             .expect("recovery record was just saved");
-        record.workspace_path = Some(workspace.to_string_lossy().to_string());
+        record.workspace_path = Some(workspace_path.to_string_lossy().to_string());
         record.updated_at = Utc::now();
         self.recovery
             .save_job(record)
             .map_err(ConnectorError::Execution)?;
         let local = LocalJob {
             job,
-            workspace_path: workspace,
+            workspace_path,
             sandbox_id: None,
             terminal: false,
             processed_actions: HashMap::new(),
         };
-        self.jobs.lock().await.insert(job_id.clone(), local);
+        let mut jobs = self.jobs.lock().await;
+        jobs.insert(job_id.clone(), local);
+        workspace_guard.keep();
+        drop(jobs);
         info!(job_id = %job_id, "connector accepted job");
         Ok(Vec::new())
     }
 
+    #[cfg(test)]
     async fn handle_action(&self, action: Action) -> Result<Vec<String>, ConnectorError> {
+        self.handle_action_until(
+            action,
+            crate::deadline::Deadline::new(Duration::from_secs(300)),
+        )
+        .await
+    }
+
+    async fn handle_action_until(
+        &self,
+        action: Action,
+        deadline: crate::deadline::Deadline,
+    ) -> Result<Vec<String>, ConnectorError> {
         validate_action(&action)?;
         if !self.jobs.lock().await.contains_key(&action.job_id) {
             let _ = self.restore_job(&action.job_id).await?;
@@ -823,7 +1258,11 @@ where
             local.sandbox_id = Some(sandbox_id);
         }
         let result = match action.verb.as_str() {
-            "create_sandbox" => match self.executor.execute(&local.job, local, &action).await {
+            "create_sandbox" => match self
+                .executor
+                .execute(&local.job, local, &action, deadline)
+                .await
+            {
                 Ok(value) => {
                     validate_response("create_sandbox", &value)?;
                     local.sandbox_id = value
@@ -841,7 +1280,11 @@ where
                 }
                 Err(error) => Err(error),
             },
-            _ => self.executor.execute(&local.job, local, &action).await,
+            _ => {
+                self.executor
+                    .execute(&local.job, local, &action, deadline)
+                    .await
+            }
         };
         let frame = match result {
             Ok(value) => self.result_frame(&action, "ok", Some(value), None),
@@ -909,10 +1352,19 @@ where
                 "invalid terminal final_status".into(),
             ));
         }
-        if !self.jobs.lock().await.contains_key(&terminal.job_id) {
-            let _ = self.restore_job(&terminal.job_id).await?;
+        let mut local = self.jobs.lock().await.remove(&terminal.job_id);
+        if local.is_none() {
+            if let Some(record) = self.recovery.job(&terminal.job_id) {
+                local = Some(LocalJob {
+                    job: serde_json::from_value(record.job)
+                        .map_err(|e| ConnectorError::Malformed(e.to_string()))?,
+                    workspace_path: PathBuf::from(record.workspace_path.unwrap_or_default()),
+                    sandbox_id: record.sandbox_id,
+                    terminal: true,
+                    processed_actions: HashMap::new(),
+                });
+            }
         }
-        let local = self.jobs.lock().await.remove(&terminal.job_id);
         let Some(mut local) = local else {
             return Ok(Vec::new());
         };
@@ -1403,6 +1855,160 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    #[tokio::test]
+    async fn renewal_denial_cancels_execution_cleans_workspace_and_posts_no_result() {
+        struct SlowExecutor(FakeExecutor);
+        #[async_trait]
+        impl ActionExecutor for SlowExecutor {
+            async fn execute(
+                &self,
+                job: &Job,
+                local: &LocalJob,
+                action: &Action,
+                deadline: crate::deadline::Deadline,
+            ) -> Result<Value, ConnectorError> {
+                sleep(Duration::from_secs(3)).await;
+                self.0.execute(job, local, action, deadline).await
+            }
+            async fn destroy(&self, local: &LocalJob) -> Result<(), ConnectorError> {
+                self.0.destroy(local).await
+            }
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            let count = stream.read(&mut bytes).await.unwrap();
+            let request = String::from_utf8_lossy(&bytes[..count]).to_string();
+            stream
+                .write_all(
+                    b"HTTP/1.1 409 Conflict\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                    .await
+                    .is_err(),
+                "unexpected result posted after denial"
+            );
+            request
+        });
+        let fake = FakeExecutor::default();
+        let mut settings = config();
+        settings.dispatch_url = format!("http://{address}");
+        let directory = tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let connector = Connector::with_cloner(
+            settings,
+            SlowExecutor(fake.clone()),
+            FakeCloner {
+                workspace: workspace.clone(),
+            },
+        );
+        let job = job();
+        let job_id = job.job_id.clone();
+        connector.handle_job(job, "run", "connector").await.unwrap();
+        let action_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let mut claim = Some(LeaseClaim {
+            job_id: job_id.clone(),
+            claim_id: Uuid::new_v4().to_string(),
+            action_id: action_id.clone(),
+            renewal_sequence: 0,
+            lease_ttl_seconds: 3,
+            lease_expires_at: now + chrono::Duration::seconds(3),
+            action_deadline_at: now + chrono::Duration::seconds(200),
+            job_deadline_at: now + chrono::Duration::seconds(300),
+        });
+        let message = action(&job_id, &action_id, "observe_failure", json!({}));
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            connector.process_http_message(&Client::new(), &message, &mut claim),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(ConnectorError::LeaseExpired(_))));
+        assert!(fake.calls.lock().await.is_empty());
+        assert_eq!(*fake.destroyed.lock().await, 1);
+        assert!(!workspace.exists());
+        assert!(connector.recovery.job(&job_id).is_none());
+        let request = server.await.unwrap();
+        assert!(request.lines().next().unwrap().contains("/lease"));
+    }
+
+    #[tokio::test]
+    async fn resumed_claim_stops_at_confirmed_expiry() {
+        let now = Utc::now();
+        let claim = LeaseClaim {
+            job_id: Uuid::new_v4().to_string(),
+            claim_id: Uuid::new_v4().to_string(),
+            action_id: Uuid::new_v4().to_string(),
+            renewal_sequence: 0,
+            lease_ttl_seconds: 30,
+            lease_expires_at: now + chrono::Duration::milliseconds(80),
+            action_deadline_at: now + chrono::Duration::seconds(60),
+            job_deadline_at: now + chrono::Duration::seconds(90),
+        };
+        let mut settings = config();
+        settings.dispatch_url = "http://127.0.0.1:9".into();
+        let failed = Arc::new(AtomicBool::new(false));
+        let heartbeat = start_lease_heartbeat(Client::new(), settings, claim, failed.clone());
+        tokio::time::timeout(Duration::from_millis(250), heartbeat.lost())
+            .await
+            .unwrap();
+        assert!(failed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn lease_deadline_caps_execution_and_rejects_expired_claim() {
+        let now = Utc::now();
+        let claim = LeaseClaim {
+            job_id: Uuid::new_v4().to_string(),
+            claim_id: Uuid::new_v4().to_string(),
+            action_id: Uuid::new_v4().to_string(),
+            renewal_sequence: 0,
+            lease_ttl_seconds: 30,
+            action_deadline_at: now + chrono::Duration::seconds(140),
+            job_deadline_at: now + chrono::Duration::seconds(150),
+            lease_expires_at: now + chrono::Duration::seconds(20),
+        };
+        let deadline = claim_deadline(&claim).unwrap();
+        assert!(deadline.cap(Duration::from_secs(300)).unwrap() <= Duration::from_secs(68));
+
+        let expired = LeaseClaim {
+            lease_expires_at: now - chrono::Duration::seconds(1),
+            ..claim
+        };
+        assert!(matches!(
+            claim_deadline(&expired),
+            Err(ConnectorError::LeaseExpired(_))
+        ));
+    }
+
+    #[test]
+    fn clone_workspace_guard_removes_unjournaled_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().to_path_buf();
+        drop(CloneWorkspace::owned(workspace));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn controller_action_timeouts_are_capped_to_absolute_budget() {
+        let mut deploy = json!({"manifests": {"path": "deploy"}});
+        cap_action_timeouts("deploy_revision", &mut deploy, Duration::from_secs(12)).unwrap();
+        assert_eq!(deploy["deploy_timeout_seconds"], 12);
+        assert_eq!(deploy["wait_seconds"], 12);
+
+        let mut validation =
+            json!({"plan": {"commands": ["true"], "health_checks": [{"timeout_seconds": 90}]}});
+        cap_action_timeouts("run_validation", &mut validation, Duration::from_secs(7)).unwrap();
+        assert_eq!(validation["plan"]["commands"][0], "true");
+        assert_eq!(validation["plan"]["health_checks"][0]["timeout_seconds"], 7);
+    }
+
     #[derive(Clone, Default)]
     struct FakeExecutor {
         calls: Arc<Mutex<Vec<String>>>,
@@ -1416,11 +2022,19 @@ mod tests {
 
     #[async_trait]
     impl WorkspaceCloner for FakeCloner {
-        async fn clone_job(&self, _job: &Job) -> Result<PathBuf, ConnectorError> {
+        async fn clone_job(
+            &self,
+            _job: &Job,
+            _deadline: crate::deadline::Deadline,
+            _cancelled: Arc<AtomicBool>,
+        ) -> Result<CloneWorkspace, ConnectorError> {
             tokio::fs::create_dir_all(&self.workspace)
                 .await
                 .map_err(|e| ConnectorError::Execution(e.to_string()))?;
-            Ok(self.workspace.clone())
+            Ok(CloneWorkspace {
+                path: self.workspace.clone(),
+                guard: None,
+            })
         }
     }
 
@@ -1431,6 +2045,7 @@ mod tests {
             _job: &Job,
             _local: &LocalJob,
             action: &Action,
+            _deadline: crate::deadline::Deadline,
         ) -> Result<Value, ConnectorError> {
             self.calls.lock().await.push(action.action_id.clone());
             match action.verb.as_str() {

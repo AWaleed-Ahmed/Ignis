@@ -14,6 +14,40 @@ use crate::domain::models::*;
 use crate::domain::service::SandboxService;
 use crate::state::recovery::value_hash;
 
+fn request_deadline(headers: &HeaderMap) -> Result<Option<crate::deadline::Deadline>, DomainError> {
+    let Some(value) = headers.get("x-raphael-action-deadline-at") else {
+        return Ok(None);
+    };
+    let text = value
+        .to_str()
+        .map_err(|_| DomainError::InvalidRequest("invalid action deadline".into()))?;
+    let absolute = chrono::DateTime::parse_from_rfc3339(text)
+        .map_err(|_| DomainError::InvalidRequest("invalid action deadline".into()))?;
+    let remaining = (absolute.with_timezone(&chrono::Utc) - chrono::Utc::now())
+        .to_std()
+        .map_err(|_| DomainError::Timeout("action deadline expired".into()))?;
+    if remaining.is_zero() {
+        return Err(DomainError::Timeout("action deadline expired".into()));
+    }
+    Ok(Some(crate::deadline::Deadline::new(remaining)))
+}
+
+async fn execute_bounded<T, F>(
+    deadline: Option<crate::deadline::Deadline>,
+    execute: F,
+) -> Result<T, DomainError>
+where
+    F: Future<Output = Result<T, DomainError>>,
+{
+    if let Some(deadline) = deadline {
+        tokio::time::timeout(deadline.remaining()?, execute)
+            .await
+            .map_err(|_| DomainError::Timeout("action deadline exhausted".into()))?
+    } else {
+        execute.await
+    }
+}
+
 async fn guarded<T, F>(
     service: &SandboxService,
     headers: &HeaderMap,
@@ -25,11 +59,12 @@ where
     T: Serialize + DeserializeOwned,
     F: Future<Output = Result<T, DomainError>>,
 {
+    let deadline = request_deadline(headers)?;
     let Some(action_id) = headers
         .get("x-raphael-connector-action-id")
         .and_then(|v| v.to_str().ok())
     else {
-        return Ok(execute.await?);
+        return Ok(execute_bounded(deadline, execute).await?);
     };
     let hash = value_hash(&request);
     if let Some(response) = service
@@ -40,7 +75,10 @@ where
         return serde_json::from_value(response)
             .map_err(|e| ApiError(DomainError::Internal(e.to_string())));
     }
-    let response = execute.await?;
+    let response = execute_bounded(deadline, execute).await?;
+    if let Some(deadline) = deadline {
+        deadline.remaining()?;
+    }
     service
         .recovery()
         .save_controller_receipt(
@@ -127,7 +165,13 @@ pub async fn run_validation(
             &headers,
             sandbox_id.clone(),
             body,
-            service.run_validation(&sandbox_id, req),
+            service.run_validation_until(
+                &sandbox_id,
+                req,
+                request_deadline(&headers)?.unwrap_or_else(|| {
+                    crate::deadline::Deadline::new(std::time::Duration::from_secs(300))
+                }),
+            ),
         )
         .await?,
     ))

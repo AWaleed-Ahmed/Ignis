@@ -452,7 +452,23 @@ impl SandboxService {
         sandbox_id: &str,
         req: RunValidationRequest,
     ) -> Result<ValidationResults, DomainError> {
-        let _operation = self.lock_sandbox(sandbox_id).await?;
+        self.run_validation_until(
+            sandbox_id,
+            req,
+            crate::deadline::Deadline::new(Duration::from_secs(300)),
+        )
+        .await
+    }
+
+    pub async fn run_validation_until(
+        &self,
+        sandbox_id: &str,
+        req: RunValidationRequest,
+        deadline: crate::deadline::Deadline,
+    ) -> Result<ValidationResults, DomainError> {
+        let _operation = timeout(deadline.remaining()?, self.lock_sandbox(sandbox_id))
+            .await
+            .map_err(|_| DomainError::Timeout("validation lock deadline exhausted".into()))??;
         let record = self.require_ready(sandbox_id)?;
 
         if record.deployed_sha.is_none() || record.rendered_yaml.is_none() {
@@ -462,10 +478,14 @@ impl SandboxService {
         }
 
         // Refresh after signature for comparisons.
-        let after = match self
-            .backend
-            .observe_workload(&record.namespace, Duration::from_secs(30))
-            .await
+        let observation_budget = deadline.cap(Duration::from_secs(30))?;
+        let after = match timeout(
+            observation_budget,
+            self.backend
+                .observe_workload(&record.namespace, observation_budget),
+        )
+        .await
+        .map_err(|_| DomainError::Timeout("validation observation deadline exhausted".into()))?
         {
             Ok(obs) => Some(observe::observe(&obs, record.rendered_yaml.as_deref())),
             Err(e) => {
@@ -475,7 +495,7 @@ impl SandboxService {
         };
 
         let workspace = std::env::var("RAPHAEL_DEFAULT_WORKSPACE").ok();
-        let tool_versions = crate::tools::collect_tool_versions();
+        let tool_versions = crate::tools::collect_tool_versions_with_deadline(deadline);
         let mut results = validate::run_validation(
             self.backend.as_ref(),
             sandbox_id,
@@ -488,13 +508,16 @@ impl SandboxService {
                 .or(record.last_signature.as_ref()),
             after.as_ref(),
             record.last_fidelity.as_ref(),
+            deadline,
         )
         .await?;
         results.tool_versions = Some(tool_versions.clone());
 
+        deadline.remaining()?;
         let tools_blob = serde_json::to_string_pretty(&tool_versions).unwrap_or_default();
         let tools_art = store_artifact(sandbox_id, "tool_versions", &tools_blob);
 
+        deadline.remaining()?;
         self.registry
             .update(sandbox_id, |r| {
                 if let Some(sig) = after.clone() {
