@@ -29,6 +29,9 @@ tempfile = "3"
 url = "2"
 walkdir = "2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }

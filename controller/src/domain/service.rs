@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::time::{sleep, timeout, Instant};
@@ -23,6 +24,7 @@ pub struct SandboxService {
     backend: Arc<dyn ClusterBackend>,
     registry: Arc<SandboxRegistry>,
     recovery: Arc<RecoveryStore>,
+    operations: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SandboxService {
@@ -31,6 +33,7 @@ impl SandboxService {
             backend,
             registry,
             recovery: Arc::new(RecoveryStore::in_memory()),
+            operations: Mutex::new(HashMap::new()),
         }
     }
 
@@ -43,7 +46,22 @@ impl SandboxService {
             backend,
             registry,
             recovery,
+            operations: Mutex::new(HashMap::new()),
         }
+    }
+
+    async fn lock_sandbox(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, DomainError> {
+        let lock = self
+            .operations
+            .lock()
+            .map_err(|_| DomainError::Internal("sandbox operation lock poisoned".into()))?
+            .entry(sandbox_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        Ok(lock.lock_owned().await)
     }
 
     pub fn recovery(&self) -> Arc<RecoveryStore> {
@@ -68,6 +86,7 @@ impl SandboxService {
         }
 
         let sandbox_id = sandbox_id_from_run(&req.run_id);
+        let _operation = self.lock_sandbox(&sandbox_id).await?;
         let namespace = namespace_for_run(&req.run_id)?;
         let now = Utc::now();
         let timeout_minutes = req.timeout_minutes.clamp(1, 120);
@@ -92,8 +111,6 @@ impl SandboxService {
             cpu_limit: "2".into(),
             memory_limit: "2Gi".into(),
         };
-
-        self.backend.create_isolated_namespace(&spec).await?;
 
         let record = SandboxRecord {
             sandbox_id: sandbox_id.clone(),
@@ -130,6 +147,10 @@ impl SandboxService {
         self.registry
             .insert(record)
             .map_err(DomainError::Conflict)?;
+
+        // Register ownership before creating anything so cancellation or a lost
+        // response still leaves an identity that terminal cleanup can destroy.
+        self.backend.create_isolated_namespace(&spec).await?;
 
         if let Some(fixture_set) = &req.secret_fixture_set {
             let (secrets_yaml, fixture_metadata) =
@@ -179,6 +200,29 @@ impl SandboxService {
         sandbox_id: &str,
         req: DeployRevisionRequest,
     ) -> Result<DeployRevisionResponse, DomainError> {
+        self.deploy_revision_until(sandbox_id, req, None).await
+    }
+
+    pub async fn deploy_revision_until(
+        &self,
+        sandbox_id: &str,
+        req: DeployRevisionRequest,
+        action_deadline: Option<crate::deadline::Deadline>,
+    ) -> Result<DeployRevisionResponse, DomainError> {
+        if !(1..=600).contains(&req.deploy_timeout_seconds) || req.wait_seconds > 600 {
+            return Err(DomainError::InvalidRequest(
+                "deploy_timeout_seconds must be 1..600 and wait_seconds 0..600".into(),
+            ));
+        }
+        let budget = Duration::from_secs(req.deploy_timeout_seconds as u64);
+        let budget = match action_deadline {
+            Some(deadline) => deadline.cap(budget)?,
+            None => budget,
+        };
+        let deadline = crate::deadline::Deadline::new(budget);
+        let _operation = timeout(deadline.remaining()?, self.lock_sandbox(sandbox_id))
+            .await
+            .map_err(|_| DomainError::Timeout("deployment lock deadline exhausted".into()))??;
         let record = self.require_ready(sandbox_id)?;
         let workspace = resolve_workspace(
             req.workspace_path.as_deref(),
@@ -186,6 +230,7 @@ impl SandboxService {
             req.repository_sha.as_str(),
             record.cloned_workspace.as_deref(),
             &record.commit_sha,
+            deadline,
         )?;
 
         // Remember controller-managed clone path for later deploys in this sandbox.
@@ -197,36 +242,61 @@ impl SandboxService {
 
         // Apply file patches into a temp workspace copy when provided.
         let effective_workspace = if let Some(patch) = &req.patch {
-            apply_patches_to_temp(&workspace, patch)?
+            apply_patches_to_temp(&workspace, patch, deadline)?
         } else {
             workspace.clone()
         };
 
-        let rendered = render::render(&effective_workspace, &req.manifests)?;
+        let rendered =
+            render::render_with_deadline(&effective_workspace, &req.manifests, deadline)?;
         policy::check_manifest_policy(&rendered.yaml)?;
 
+        deadline.remaining()?;
+        // Once apply starts the workload may change even if the command times out.
+        // Clear candidate-specific evidence before the first cluster mutation.
+        self.registry
+            .update(sandbox_id, |r| {
+                r.deployed_sha = None;
+                r.rendered_yaml = None;
+                r.resources.clear();
+                r.image_refs.clear();
+                r.last_fidelity = None;
+                r.last_patch = None;
+                r.last_signature = None;
+                r.after_signature = None;
+                r.last_validation = None;
+                r.finalized_result = None;
+            })
+            .map_err(DomainError::Internal)?;
+        deadline.remaining()?;
         let apply = self
             .backend
-            .apply_manifests(
-                &record.namespace,
-                &rendered.yaml,
-                Duration::from_secs(req.wait_seconds as u64),
-            )
+            .apply_manifests(&record.namespace, &rendered.yaml, deadline.remaining()?)
             .await?;
 
         let mut image_refs = apply.image_refs.clone();
         // The real API server may accept a Deployment before any Pod has an imageID.
         // Bound the entire best-effort lookup by the request's existing wait_seconds.
         // Mock has no runtime digests: preserve its immediate tags-only behavior.
+        deadline.remaining()?;
+        // Leave response/report headroom after optional runtime evidence gathering.
+        let digest_budget = deadline
+            .remaining()?
+            .saturating_sub(Duration::from_secs(2))
+            .min(Duration::from_secs(req.wait_seconds as u64));
         let digests = if self.backend.name() == "mock" {
-            self.backend
-                .resolve_image_digests(&record.namespace)
-                .await
-                .unwrap_or_default()
+            timeout(
+                digest_budget,
+                self.backend.resolve_image_digests(&record.namespace),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
         } else {
             poll_image_digests(
                 &apply.image_refs,
-                Duration::from_secs(req.wait_seconds as u64),
+                digest_budget,
                 Duration::from_millis(500),
                 || self.backend.resolve_image_digests(&record.namespace),
             )
@@ -238,14 +308,21 @@ impl SandboxService {
             }
         }
 
-        let tool_versions = crate::tools::collect_tool_versions();
+        let tool_versions =
+            crate::tools::collect_tool_versions_with_deadline(crate::deadline::Deadline::new(
+                deadline
+                    .remaining()?
+                    .saturating_sub(Duration::from_secs(1))
+                    .min(Duration::from_secs(5)),
+            ));
+        deadline.remaining()?;
         let fixture_inventory = inventory_with_bundled_fixtures(
             record.applied_secret_fixtures.as_ref(),
             &rendered.yaml,
             &record.namespace,
         );
         let mut fidelity_record = record.clone();
-        fidelity_record.applied_secret_fixtures = Some(fixture_inventory.clone());
+        fidelity_record.applied_secret_fixtures = Some(fixture_inventory);
         let fidelity = build_fidelity(
             &fidelity_record,
             &req,
@@ -261,6 +338,7 @@ impl SandboxService {
         let artifact_id = manifest_art.id.clone();
         let tools_artifact_id = tools_art.id.clone();
 
+        deadline.remaining()?;
         self.registry
             .update(sandbox_id, |r| {
                 r.deployed_sha = Some(req.repository_sha.clone());
@@ -268,7 +346,6 @@ impl SandboxService {
                 r.resources = apply.resources.clone();
                 r.image_refs = image_refs.clone();
                 r.last_fidelity = Some(fidelity.clone());
-                r.applied_secret_fixtures = Some(fixture_inventory.clone());
                 r.last_patch = req.patch.clone();
                 // A new deploy invalidates any previous finalize for safety.
                 r.finalized_result = None;
@@ -296,6 +373,11 @@ impl SandboxService {
         sandbox_id: &str,
         req: ObserveFailureRequest,
     ) -> Result<ObserveFailureResponse, DomainError> {
+        let deadline =
+            crate::deadline::Deadline::new(Duration::from_secs(req.timeout_seconds as u64));
+        let _operation = timeout(deadline.remaining()?, self.lock_sandbox(sandbox_id))
+            .await
+            .map_err(|_| DomainError::Timeout("observation lock deadline exhausted".into()))??;
         let record = self.require_ready(sandbox_id)?;
         if record.rendered_yaml.is_none() {
             return Err(DomainError::ObservationFailed(
@@ -304,10 +386,7 @@ impl SandboxService {
         }
         let obs = self
             .backend
-            .observe_workload(
-                &record.namespace,
-                Duration::from_secs(req.timeout_seconds as u64),
-            )
+            .observe_workload(&record.namespace, deadline.remaining()?)
             .await?;
 
         let signature = observe::observe(&obs, record.rendered_yaml.as_deref());
@@ -340,24 +419,29 @@ impl SandboxService {
                 .map_err(DomainError::Internal)?;
         }
 
-        // Bounded pod logs.
-        if let Ok(logs) = self
-            .backend
-            .collect_pod_logs(&record.namespace, 8_192)
+        // Optional logs use the same deadline as observation and lock acquisition.
+        if let Ok(remaining) = deadline.remaining() {
+            if let Ok(Ok(logs)) = timeout(
+                remaining,
+                self.backend
+                    .collect_pod_logs(&record.namespace, 8_192, remaining),
+            )
             .await
-        {
-            for log in logs {
-                let content = format!(
-                    "pod={} container={}\n{}",
-                    log.pod, log.container, log.content
-                );
-                let art = store_artifact(sandbox_id, "container_log", &content);
-                artifact_ids.push(art.id.clone());
-                self.registry
-                    .update(sandbox_id, |r| {
-                        r.artifacts.push(art);
-                    })
-                    .map_err(DomainError::Internal)?;
+            {
+                for log in logs {
+                    if deadline.remaining().is_err() {
+                        break;
+                    }
+                    let content = format!(
+                        "pod={} container={}\n{}",
+                        log.pod, log.container, log.content
+                    );
+                    let art = store_artifact(sandbox_id, "container_log", &content);
+                    artifact_ids.push(art.id.clone());
+                    self.registry
+                        .update(sandbox_id, |r| r.artifacts.push(art))
+                        .map_err(DomainError::Internal)?;
+                }
             }
         }
 
@@ -390,13 +474,40 @@ impl SandboxService {
         sandbox_id: &str,
         req: RunValidationRequest,
     ) -> Result<ValidationResults, DomainError> {
+        self.run_validation_until(
+            sandbox_id,
+            req,
+            crate::deadline::Deadline::new(Duration::from_secs(300)),
+        )
+        .await
+    }
+
+    pub async fn run_validation_until(
+        &self,
+        sandbox_id: &str,
+        req: RunValidationRequest,
+        deadline: crate::deadline::Deadline,
+    ) -> Result<ValidationResults, DomainError> {
+        let _operation = timeout(deadline.remaining()?, self.lock_sandbox(sandbox_id))
+            .await
+            .map_err(|_| DomainError::Timeout("validation lock deadline exhausted".into()))??;
         let record = self.require_ready(sandbox_id)?;
 
+        if record.deployed_sha.is_none() || record.rendered_yaml.is_none() {
+            return Err(DomainError::ValidationUnavailable(
+                "no completed deployment; workload state is unavailable or uncertain".into(),
+            ));
+        }
+
         // Refresh after signature for comparisons.
-        let after = match self
-            .backend
-            .observe_workload(&record.namespace, Duration::from_secs(30))
-            .await
+        let observation_budget = deadline.cap(Duration::from_secs(30))?;
+        let after = match timeout(
+            observation_budget,
+            self.backend
+                .observe_workload(&record.namespace, observation_budget),
+        )
+        .await
+        .map_err(|_| DomainError::Timeout("validation observation deadline exhausted".into()))?
         {
             Ok(obs) => Some(observe::observe(&obs, record.rendered_yaml.as_deref())),
             Err(e) => {
@@ -406,7 +517,7 @@ impl SandboxService {
         };
 
         let workspace = std::env::var("RAPHAEL_DEFAULT_WORKSPACE").ok();
-        let tool_versions = crate::tools::collect_tool_versions();
+        let tool_versions = crate::tools::collect_tool_versions_with_deadline(deadline);
         let mut results = validate::run_validation(
             self.backend.as_ref(),
             sandbox_id,
@@ -419,13 +530,16 @@ impl SandboxService {
                 .or(record.last_signature.as_ref()),
             after.as_ref(),
             record.last_fidelity.as_ref(),
+            deadline,
         )
         .await?;
         results.tool_versions = Some(tool_versions.clone());
 
+        deadline.remaining()?;
         let tools_blob = serde_json::to_string_pretty(&tool_versions).unwrap_or_default();
         let tools_art = store_artifact(sandbox_id, "tool_versions", &tools_blob);
 
+        deadline.remaining()?;
         self.registry
             .update(sandbox_id, |r| {
                 if let Some(sig) = after.clone() {
@@ -447,6 +561,7 @@ impl SandboxService {
         sandbox_id: &str,
         req: FinalizeResultRequest,
     ) -> Result<FinalizeResultResponse, DomainError> {
+        let _operation = self.lock_sandbox(sandbox_id).await?;
         let record = self.require_ready(sandbox_id)?;
 
         if let Some(existing) = &record.finalized_result {
@@ -555,6 +670,7 @@ impl SandboxService {
         sandbox_id: &str,
         _req: DestroySandboxRequest,
     ) -> Result<DestroySandboxResponse, DomainError> {
+        let _operation = self.lock_sandbox(sandbox_id).await?;
         let now = Utc::now();
         let existing = self.registry.get(sandbox_id);
         match existing {
@@ -766,6 +882,7 @@ fn resolve_workspace(
     deploy_sha: &str,
     existing_clone: Option<&str>,
     create_sha: &str,
+    deadline: crate::deadline::Deadline,
 ) -> Result<String, DomainError> {
     if let Some(p) = path {
         let pb = PathBuf::from(p);
@@ -789,7 +906,7 @@ fn resolve_workspace(
         } else {
             create_sha
         };
-        let cloned = crate::gitclone::clone_at_sha(url, sha)?;
+        let cloned = crate::gitclone::clone_at_sha_with_deadline(url, sha, deadline)?;
         return Ok(cloned.to_string_lossy().to_string());
     }
     std::env::var("RAPHAEL_DEFAULT_WORKSPACE").map_err(|_| {
@@ -800,13 +917,17 @@ fn resolve_workspace(
     })
 }
 
-fn apply_patches_to_temp(workspace: &str, patch: &PatchSpec) -> Result<String, DomainError> {
+fn apply_patches_to_temp(
+    workspace: &str,
+    patch: &PatchSpec,
+    deadline: crate::deadline::Deadline,
+) -> Result<String, DomainError> {
     let tmp = tempfile::tempdir().map_err(|e| DomainError::Internal(e.to_string()))?;
-    copy_dir_recursive(PathBuf::from(workspace), tmp.path().to_path_buf())
-        .map_err(|e| DomainError::Internal(e.to_string()))?;
+    copy_dir_recursive(PathBuf::from(workspace), tmp.path().to_path_buf(), deadline)?;
 
     if let Some(files) = &patch.files {
         for f in files {
+            deadline.remaining()?;
             let dest = tmp.path().join(&f.path);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)
@@ -825,22 +946,28 @@ fn apply_patches_to_temp(workspace: &str, patch: &PatchSpec) -> Result<String, D
     Ok(tmp.keep().to_string_lossy().to_string())
 }
 
-fn copy_dir_recursive(from: PathBuf, to: PathBuf) -> std::io::Result<()> {
-    std::fs::create_dir_all(&to)?;
+fn copy_dir_recursive(
+    from: PathBuf,
+    to: PathBuf,
+    deadline: crate::deadline::Deadline,
+) -> Result<(), DomainError> {
+    std::fs::create_dir_all(&to).map_err(|e| DomainError::Internal(e.to_string()))?;
     for entry in walkdir::WalkDir::new(&from)
         .into_iter()
         .filter_map(|e| e.ok())
     {
+        deadline.remaining()?;
         let path = entry.path();
         let rel = path.strip_prefix(&from).unwrap();
         let dest = to.join(rel);
         if path.is_dir() {
-            std::fs::create_dir_all(&dest)?;
+            std::fs::create_dir_all(&dest).map_err(|e| DomainError::Internal(e.to_string()))?;
         } else if path.is_file() {
             if let Some(parent) = dest.parent() {
-                std::fs::create_dir_all(parent)?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| DomainError::Internal(e.to_string()))?;
             }
-            std::fs::copy(path, &dest)?;
+            std::fs::copy(path, &dest).map_err(|e| DomainError::Internal(e.to_string()))?;
         }
     }
     Ok(())
@@ -1489,6 +1616,152 @@ mod secret_inventory_tests {
 }
 
 #[cfg(test)]
+mod action_deadline_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_redeploy_invalidates_finalized_candidate_and_concurrent_operations_wait() {
+        let registry = Arc::new(SandboxRegistry::new());
+        let backend = Arc::new(crate::k8s::mock::MockCluster::new());
+        let service = Arc::new(SandboxService::new(backend.clone(), registry.clone()));
+        let created = service.create_sandbox(serde_json::from_value(serde_json::json!({
+            "run_id":"redeploy-proof", "tenant_id":"test", "repository":{"owner":"o","name":"n"}, "commit_sha":"1234567"
+        })).unwrap()).await.unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("app.yaml"), "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: owned-proof\ndata:\n  status: healthy\n").unwrap();
+        let deploy: DeployRevisionRequest = serde_json::from_value(serde_json::json!({
+            "repository_sha":"1234567", "workspace_path":workspace.path(), "manifests":{"type":"yaml","path":"app.yaml"}, "wait_seconds":0
+        })).unwrap();
+        service
+            .deploy_revision(&created.sandbox_id, deploy.clone())
+            .await
+            .unwrap();
+        let validation: RunValidationRequest = serde_json::from_value(
+            serde_json::json!({"plan":{"commands":["true"],"health_checks":[]}}),
+        )
+        .unwrap();
+        assert!(
+            service
+                .run_validation(&created.sandbox_id, validation.clone())
+                .await
+                .unwrap()
+                .passed
+        );
+        service
+            .finalize_result(
+                &created.sandbox_id,
+                FinalizeResultRequest {
+                    notes: None,
+                    require_patch: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(service.get_result(&created.sandbox_id).is_ok());
+
+        // A real backend can lose a namespace between successful finalize and
+        // redeploy. Mock deletion reproduces an apply failure after invalidation.
+        backend.destroy_namespace(&created.namespace).await.unwrap();
+        let held = service.lock_sandbox(&created.sandbox_id).await.unwrap();
+        let deployment = service.deploy_revision(&created.sandbox_id, deploy);
+        let validating = service.run_validation(&created.sandbox_id, validation.clone());
+        let finalizing = service.finalize_result(
+            &created.sandbox_id,
+            FinalizeResultRequest {
+                notes: None,
+                require_patch: false,
+            },
+        );
+        tokio::pin!(deployment, validating, finalizing);
+        // Poll all real public operations into the FIFO mutex queue while the
+        // deployment is blocked. None may observe/freeze the old successful state.
+        assert!(timeout(Duration::from_millis(20), &mut deployment)
+            .await
+            .is_err());
+        assert!(timeout(Duration::from_millis(20), &mut validating)
+            .await
+            .is_err());
+        assert!(timeout(Duration::from_millis(20), &mut finalizing)
+            .await
+            .is_err());
+        drop(held);
+        let (deployed, validated, finalized) = timeout(Duration::from_secs(2), async {
+            tokio::join!(deployment, validating, finalizing)
+        })
+        .await
+        .unwrap();
+        assert!(deployed.is_err() && validated.is_err() && finalized.is_err());
+        let record = registry.get(&created.sandbox_id).unwrap();
+        assert!(record.finalized_result.is_none() && record.last_validation.is_none());
+        assert!(record.deployed_sha.is_none() && record.rendered_yaml.is_none());
+        assert!(service.get_result(&created.sandbox_id).is_err());
+        assert!(service
+            .finalize_result(
+                &created.sandbox_id,
+                FinalizeResultRequest {
+                    notes: None,
+                    require_patch: false
+                }
+            )
+            .await
+            .is_err());
+        assert!(service
+            .run_validation(&created.sandbox_id, validation)
+            .await
+            .is_err());
+
+        let held = service.lock_sandbox(&created.sandbox_id).await.unwrap();
+        let destroy_service = service.clone();
+        let sandbox_id = created.sandbox_id.clone();
+        let mut destroy = tokio::spawn(async move {
+            destroy_service
+                .destroy_sandbox(&sandbox_id, DestroySandboxRequest { reason: None })
+                .await
+        });
+        assert!(timeout(Duration::from_millis(50), &mut destroy)
+            .await
+            .is_err());
+        assert_eq!(
+            registry.get(&created.sandbox_id).unwrap().status,
+            SandboxStatus::Ready
+        );
+        drop(held);
+        timeout(Duration::from_secs(1), destroy)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registry.get(&created.sandbox_id).unwrap().status,
+            SandboxStatus::Destroyed
+        );
+    }
+
+    #[tokio::test]
+    async fn deployment_lock_wait_uses_action_deadline_not_the_body_default() {
+        let service = SandboxService::new(
+            Arc::new(crate::k8s::mock::MockCluster::new()),
+            Arc::new(SandboxRegistry::new()),
+        );
+        let _held = service.lock_sandbox("sb-deadline").await.unwrap();
+        let request: DeployRevisionRequest = serde_json::from_value(serde_json::json!({
+            "repository_sha":"abcdef1234567", "manifests":{"type":"yaml", "path":"app.yaml"}
+        }))
+        .unwrap();
+        let start = Instant::now();
+        let result = service
+            .deploy_revision_until(
+                "sb-deadline",
+                request,
+                Some(crate::deadline::Deadline::new(Duration::from_millis(20))),
+            )
+            .await;
+        assert!(matches!(result, Err(DomainError::Timeout(_))));
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+}
+
+#[cfg(test)]
 mod secret_coverage_fidelity_tests {
     use super::*;
     use crate::k8s::mock::MockCluster;
@@ -1652,6 +1925,7 @@ mod secret_coverage_fidelity_tests {
                     },
                     patch: None,
                     wait_seconds: 0,
+                    deploy_timeout_seconds: None,
                 },
             )
             .await

@@ -75,6 +75,35 @@ def test_destroy_response_schema():
     Draft202012Validator(schema).validate(instance)
 
 
+def test_connector_lease_claim_and_renewal_contracts():
+    claim = {
+        "job_id": "11111111-1111-4111-8111-111111111111",
+        "claim_id": "22222222-2222-4222-8222-222222222222",
+        "action_id": "33333333-3333-4333-8333-333333333333",
+        "renewal_sequence": 1,
+        "lease_ttl_seconds": 30,
+        "action_deadline_at": "2026-10-13T12:30:00Z",
+        "job_deadline_at": "2026-10-13T13:00:00Z",
+        "lease_expires_at": "2026-10-13T12:01:00Z",
+    }
+    Draft202012Validator(_load("connector/v1/lease-claim.schema.json")).validate(claim)
+    assert not Draft202012Validator(_load("connector/v1/lease-claim.schema.json")).is_valid(
+        {**claim, "connector_id": "private-owner"}
+    )
+
+    request = {
+        "action_id": claim["action_id"],
+        "claim_id": claim["claim_id"],
+        "renewal_sequence": 1,
+    }
+    validator = Draft202012Validator(
+        _load("connector/v1/lease-renewal-request.schema.json")
+    )
+    validator.validate(request)
+    assert not validator.is_valid({**request, "renewal_sequence": True})
+    assert not validator.is_valid({**request, "unexpected": "field"})
+
+
 def test_validation_results_schema():
     schema = _load("validation_results.json")
     instance = {

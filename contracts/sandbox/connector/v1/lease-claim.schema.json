@@ -1,0 +1,18 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raphael.dev/contracts/sandbox/connector/v1/lease-claim.schema.json",
+  "title": "ConnectorLeaseClaim",
+  "type": "object",
+  "required": ["job_id", "claim_id", "action_id", "renewal_sequence", "lease_ttl_seconds", "action_deadline_at", "job_deadline_at", "lease_expires_at"],
+  "additionalProperties": false,
+  "properties": {
+    "job_id": { "type": "string", "format": "uuid" },
+    "claim_id": { "type": "string", "format": "uuid" },
+    "action_id": { "type": "string", "format": "uuid" },
+    "renewal_sequence": { "type": "integer", "minimum": 0 },
+    "lease_ttl_seconds": { "type": "integer", "minimum": 1 },
+    "action_deadline_at": { "type": "string", "format": "date-time" },
+    "job_deadline_at": { "type": "string", "format": "date-time" },
+    "lease_expires_at": { "type": "string", "format": "date-time" }
+  }
+}
