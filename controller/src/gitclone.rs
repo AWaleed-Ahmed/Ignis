@@ -207,7 +207,9 @@ fn run_git_output(
         cancelled,
     )
     .map_err(|e| match e.kind() {
-        std::io::ErrorKind::TimedOut => DomainError::Timeout("git command timed out".into()),
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted => {
+            DomainError::Timeout("git command timed out or was cancelled".into())
+        }
         std::io::ErrorKind::NotFound => {
             DomainError::Internal("git binary not found; install git for clone-at-SHA".into())
         }

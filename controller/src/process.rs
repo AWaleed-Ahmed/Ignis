@@ -28,6 +28,12 @@ pub fn output_with_cancel(
     budget: Duration,
     cancelled: Option<&AtomicBool>,
 ) -> io::Result<Output> {
+    if cancelled.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "tool execution cancelled",
+        ));
+    }
     if budget.is_zero() {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
@@ -152,6 +158,20 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn already_cancelled_command_is_never_spawned() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("unexpected");
+        let error = output_with_cancel(
+            Command::new("touch").arg(&marker),
+            Duration::from_secs(1),
+            Some(&AtomicBool::new(true)),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!marker.exists());
+    }
 
     #[test]
     fn cancellation_kills_owned_process_group() {
