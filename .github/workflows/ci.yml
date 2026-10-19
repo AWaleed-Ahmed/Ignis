@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -47,3 +48,44 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  clone-qualification:
+    name: Checkout fidelity / system attributes ${{ matrix.system_attributes }}
+    runs-on: ubuntu-latest
+    container: ubuntu:24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        system_attributes: [absent, conflicting]
+    env:
+      IGNIS_SYSTEM_ATTRIBUTES_CASE: ${{ matrix.system_attributes }}
+    steps:
+      - name: Install owned-container tools
+        run: apt-get update -qq && apt-get install -y --no-install-recommends git curl ca-certificates build-essential python3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Configure owned system attributes and verify the control
+        shell: bash
+        run: |
+          # This file belongs to the disposable container, never the runner host.
+          if [ "$IGNIS_SYSTEM_ATTRIBUTES_CASE" = conflicting ]; then
+            printf '* text eol=crlf\n' > /etc/gitattributes
+            control=$(mktemp -d)
+            git -C "$control" init -q --template=
+            git -C "$control" check-attr eol -- plain.txt | tee /tmp/system-attribute-control.txt
+            grep -q 'eol: crlf' /tmp/system-attribute-control.txt
+          else
+            test ! -e /etc/gitattributes
+          fi
+      - name: Prepare locked test dependencies
+        run: cargo test --manifest-path controller/Cargo.toml --locked --lib --no-run
+      - name: Qualify both clone paths, bytes/hashes, minimal patch and HTTP helper
+        run: python3 harness/verify_clone_policy.py --output qualification/clone-policy.json
+      - name: Upload qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clone-policy-${{ matrix.system_attributes }}-${{ github.run_id }}
+          path: qualification/
+          if-no-files-found: warn

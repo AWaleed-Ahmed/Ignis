@@ -1539,6 +1539,124 @@ mod action_deadline_tests {
     use super::*;
 
     #[tokio::test]
+    async fn failed_redeploy_invalidates_finalized_candidate_and_concurrent_operations_wait() {
+        let registry = Arc::new(SandboxRegistry::new());
+        let backend = Arc::new(crate::k8s::mock::MockCluster::new());
+        let service = Arc::new(SandboxService::new(backend.clone(), registry.clone()));
+        let created = service.create_sandbox(serde_json::from_value(serde_json::json!({
+            "run_id":"redeploy-proof", "tenant_id":"test", "repository":{"owner":"o","name":"n"}, "commit_sha":"1234567"
+        })).unwrap()).await.unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("app.yaml"), "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: owned-proof\ndata:\n  status: healthy\n").unwrap();
+        let deploy: DeployRevisionRequest = serde_json::from_value(serde_json::json!({
+            "repository_sha":"1234567", "workspace_path":workspace.path(), "manifests":{"type":"yaml","path":"app.yaml"}, "wait_seconds":0
+        })).unwrap();
+        service
+            .deploy_revision(&created.sandbox_id, deploy.clone())
+            .await
+            .unwrap();
+        let validation: RunValidationRequest = serde_json::from_value(
+            serde_json::json!({"plan":{"commands":["true"],"health_checks":[]}}),
+        )
+        .unwrap();
+        assert!(
+            service
+                .run_validation(&created.sandbox_id, validation.clone())
+                .await
+                .unwrap()
+                .passed
+        );
+        service
+            .finalize_result(
+                &created.sandbox_id,
+                FinalizeResultRequest {
+                    notes: None,
+                    require_patch: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(service.get_result(&created.sandbox_id).is_ok());
+
+        // A real backend can lose a namespace between successful finalize and
+        // redeploy. Mock deletion reproduces an apply failure after invalidation.
+        backend.destroy_namespace(&created.namespace).await.unwrap();
+        let held = service.lock_sandbox(&created.sandbox_id).await.unwrap();
+        let deployment = service.deploy_revision(&created.sandbox_id, deploy);
+        let validating = service.run_validation(&created.sandbox_id, validation.clone());
+        let finalizing = service.finalize_result(
+            &created.sandbox_id,
+            FinalizeResultRequest {
+                notes: None,
+                require_patch: false,
+            },
+        );
+        tokio::pin!(deployment, validating, finalizing);
+        // Poll all real public operations into the FIFO mutex queue while the
+        // deployment is blocked. None may observe/freeze the old successful state.
+        assert!(timeout(Duration::from_millis(20), &mut deployment)
+            .await
+            .is_err());
+        assert!(timeout(Duration::from_millis(20), &mut validating)
+            .await
+            .is_err());
+        assert!(timeout(Duration::from_millis(20), &mut finalizing)
+            .await
+            .is_err());
+        drop(held);
+        let (deployed, validated, finalized) = timeout(Duration::from_secs(2), async {
+            tokio::join!(deployment, validating, finalizing)
+        })
+        .await
+        .unwrap();
+        assert!(deployed.is_err() && validated.is_err() && finalized.is_err());
+        let record = registry.get(&created.sandbox_id).unwrap();
+        assert!(record.finalized_result.is_none() && record.last_validation.is_none());
+        assert!(record.deployed_sha.is_none() && record.rendered_yaml.is_none());
+        assert!(service.get_result(&created.sandbox_id).is_err());
+        assert!(service
+            .finalize_result(
+                &created.sandbox_id,
+                FinalizeResultRequest {
+                    notes: None,
+                    require_patch: false
+                }
+            )
+            .await
+            .is_err());
+        assert!(service
+            .run_validation(&created.sandbox_id, validation)
+            .await
+            .is_err());
+
+        let held = service.lock_sandbox(&created.sandbox_id).await.unwrap();
+        let destroy_service = service.clone();
+        let sandbox_id = created.sandbox_id.clone();
+        let mut destroy = tokio::spawn(async move {
+            destroy_service
+                .destroy_sandbox(&sandbox_id, DestroySandboxRequest { reason: None })
+                .await
+        });
+        assert!(timeout(Duration::from_millis(50), &mut destroy)
+            .await
+            .is_err());
+        assert_eq!(
+            registry.get(&created.sandbox_id).unwrap().status,
+            SandboxStatus::Ready
+        );
+        drop(held);
+        timeout(Duration::from_secs(1), destroy)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registry.get(&created.sandbox_id).unwrap().status,
+            SandboxStatus::Destroyed
+        );
+    }
+
+    #[tokio::test]
     async fn deployment_lock_wait_uses_action_deadline_not_the_body_default() {
         let service = SandboxService::new(
             Arc::new(crate::k8s::mock::MockCluster::new()),

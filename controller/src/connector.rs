@@ -953,6 +953,14 @@ where
                             "claim does not match the action".into(),
                         ));
                     }
+                    // A redelivered claim can outlive local cleanup after renewal
+                    // denial. Never post a new result for work we no longer own.
+                    if claim.is_some()
+                        && action.verb != "create_sandbox"
+                        && !self.restore_job(&action.job_id).await?
+                    {
+                        return Err(ConnectorError::LeaseExpired(action.job_id.clone()));
+                    }
                     let lease_failed = Arc::new(AtomicBool::new(false));
                     let active_claim = claim
                         .as_ref()
@@ -2247,6 +2255,12 @@ mod tests {
         assert_eq!(*fake.destroyed.lock().await, 1);
         assert!(!workspace.exists());
         assert!(connector.recovery.job(&job_id).is_none());
+        // Dispatch can redeliver the still-unexpired claim after reconnect. Local
+        // cleanup revoked this work; do not emit an unknown-job failure result.
+        let replay = connector
+            .process_http_message(&Client::new(), &message, &mut claim)
+            .await;
+        assert!(matches!(replay, Err(ConnectorError::LeaseExpired(_))));
         let request = server.await.unwrap();
         assert!(request.lines().next().unwrap().contains("/lease"));
     }
