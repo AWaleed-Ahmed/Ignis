@@ -104,7 +104,8 @@ fn owned_tools_share_deadline_and_kill_descendants() {
             !root.path().join("late").exists(),
             "{case}: late completion"
         );
-        let pids = fs::read_to_string(root.path().join("pids")).unwrap();
+        let pids = fs::read_to_string(root.path().join("pids"))
+            .unwrap_or_else(|e| panic!("{case}: no stalled child: {e}"));
         for pid in pids.split_whitespace() {
             let stat = fs::read_to_string(format!("/proc/{pid}/stat"));
             assert!(
@@ -138,7 +139,7 @@ fn owned_tools_share_deadline_and_kill_descendants() {
 fn exercise(case: &str) {
     let root = std::env::var("BOUND_ROOT").unwrap();
     let start = Instant::now();
-    let budget = Duration::from_millis(1000);
+    let budget = Duration::from_millis(2000);
     let deadline = Deadline::new(budget);
     let result = match case {
         "git-cancel" => {
@@ -200,10 +201,10 @@ fn exercise(case: &str) {
         "{case}: expected timeout"
     );
     if case != "git-cancel" {
-        assert!(start.elapsed() >= Duration::from_millis(900));
+        assert!(start.elapsed() >= Duration::from_millis(1900));
     }
     assert!(
-        start.elapsed() < Duration::from_millis(1400),
+        start.elapsed() < Duration::from_millis(2400),
         "{case}: budget reset: {:?}",
         start.elapsed()
     );
