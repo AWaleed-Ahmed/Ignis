@@ -1930,7 +1930,7 @@ mod secret_coverage_fidelity_tests {
             )
             .await
             .unwrap();
-        assert_eq!(deployed.fidelity.checklist.dependencies_available, true);
+        assert!(deployed.fidelity.checklist.dependencies_available);
         assert!(deployed.fidelity.secret_coverage.as_ref().unwrap().complete);
         assert!(deployed
             .fidelity
