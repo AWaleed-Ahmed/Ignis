@@ -1,6 +1,6 @@
 # Completion checklist: Ignis #11, #13 and #17
 
-Updated: **2026-10-19**. Status: **source recovery implemented and locally verified; release qualification remains**.
+Updated: **2026-10-19**. Status: **qualification implementation complete; final hosted proof and reviewed runtime delivery pending**.
 
 This is the shared delivery checklist for:
 
@@ -13,6 +13,21 @@ The same document is saved in both repositories at
 for the delivered pair has been attached here. Existing code is not proof of
 completion. The user reviews merges and releases; pushing these branches does
 not authorize either.
+
+## Latest qualification checkpoint — 2026-10-19
+
+Remaining tests/workflow implementation is in Ignis #22 and Raphael #51 on
+`test/qualify-11-13-17`. See [case-by-case results, exact code identities,
+review fixes and remaining delivery gates](qualify-11-13-17-review-2026-10-19.md).
+This checkpoint supersedes old statements below that candidate branch special
+cases, Secret-kind pin alignment, authenticated HTTP clones or owned system
+attribute matrices are still unimplemented. They are implemented/tested; final
+released-pair qualification and user merge/release approval remain.
+
+The prior contracts-v1.4.0 approval/release is complete. New cancellation and
+claim-redelivery corrections require a subsequent reviewed runtime release;
+REL-06/07 below are reopened for that new delivery, not a claim the prior release
+failed. The original recovery history follows for provenance.
 
 ## 0. Current recovery checkpoint
 
@@ -73,16 +88,16 @@ must not be advertised as independent registry verification.
 
 ### Implementation and focused controls
 
-- [ ] IMG-01 Audit/review the recovered Ignis runtime classifier and paired Raphael consumer: live evidence takes precedence, mock sentinels remain explicitly mock, and image names alone cannot authorize repair.
+- [x] IMG-01 Audit/review the recovered Ignis runtime classifier and paired Raphael consumer: live evidence takes precedence, mock sentinels remain explicitly mock, and image names alone cannot authorize repair.
 - [ ] IMG-02 Prove an arbitrary nonexistent image/tag without sentinel words is detected from real current Pod pull failure evidence. A healthy image with a sentinel-like name must not become confirmed absence.
-- [ ] IMG-03 Verify exact namespace, current Pod UID, Pod→ReplicaSet→Deployment ownership UIDs, container name/type, current spec image and event freshness. Stale image/status/event, owner lookup denial, truncated/conflicting evidence and ambiguous multi-container attribution must refuse replacement.
-- [ ] IMG-04 Verify auth denial/private ambiguous absence, DNS/TLS/network errors, throttling and backoff-only evidence cause no image replacement. Label parser fixtures separately from actual registry/cluster observations.
-- [ ] IMG-05 Verify unsupported init targets refuse repair. A valid repair changes only the approved regular-container target and preserves unrelated workload content.
-- [ ] IMG-06 Prove confirmed absence without verified scoped provenance refuses; with a verified healthy baseline, the approved image is the only replacement. A catalog row alone is not authorization.
+- [x] IMG-03 Verify exact namespace, current Pod UID, Pod→ReplicaSet→Deployment ownership UIDs, container name/type, current spec image and event freshness. Stale image/status/event, owner lookup denial, truncated/conflicting evidence and ambiguous multi-container attribution must refuse replacement.
+- [x] IMG-04 Verify auth denial/private ambiguous absence, DNS/TLS/network errors, throttling and backoff-only evidence cause no image replacement. Label parser fixtures separately from actual registry/cluster observations.
+- [x] IMG-05 Verify unsupported init targets refuse repair. A valid repair changes only the approved regular-container target and preserves unrelated workload content.
+- [x] IMG-06 Prove confirmed absence without verified scoped provenance refuses; with a verified healthy baseline, the approved image is the only replacement. A catalog row alone is not authorization.
 
 ### Hosted acceptance
 
-- [ ] IMG-07 Run the positive verified-provenance real-kind case against the exact reviewed Ignis candidate SHA. Current main retains this as manual-only under [Raphael #49](https://github.com/AWaleed-Ahmed/Raphael/issues/49); do not interpret a run that omits it as proof.
+- [ ] IMG-07 Run the positive verified-provenance real-kind case against the exact reviewed Ignis candidate SHA. The candidate makes it required for every workflow event; retain this gate until final candidate and released-pair proof is inspected.
 - [ ] IMG-08 Inspect genuine pre-fix ErrImagePull/ImagePullBackOff evidence, selected workload/container, baseline identity, target-only patch, passed validation and independently Ready post-fix Pod. Require `fix_finalized` for the authorized positive case.
 - [ ] IMG-09 Run no-provenance refusal and existing probe repair, mock/eval/report-audit and Secret-fixture regressions on the same delivered pair. Record what negative controls were real Kubernetes versus deterministic fixtures.
 - [ ] IMG-10 After reviewed runtime release/pin alignment, restore the positive case to required automatic checks. It must not remain optional when #11 is declared complete.
@@ -102,10 +117,10 @@ summary states the actual registry-verification limits.
 
 ### Repeatable verification matrix
 
-- [ ] CLN-05 Exercise ambient `core.autocrlf=false,input,true` and `core.eol=lf,crlf,native`; none/conflicting global/owned system attributes; and a hostile template containing `info/attributes`. Use owned test config/container paths, not developer system files.
-- [ ] CLN-06 Cover LF blobs, intentional CRLF blobs, explicit eol=lf/eol=crlf, nested attributes, mixed `-text`, Unicode, missing final newline and binary/NUL content. Assert expected checkout and blob bytes/hash under the documented policy.
+- [x] CLN-05 Exercise ambient `core.autocrlf=false,input,true` and `core.eol=lf,crlf,native`; none/conflicting global/owned system attributes; and a hostile template containing `info/attributes`. Use owned test config/container paths, not developer system files.
+- [x] CLN-06 Cover LF blobs, intentional CRLF blobs, explicit eol=lf/eol=crlf, nested attributes, mixed `-text`, Unicode, missing final newline and binary/NUL content. Assert expected checkout and blob bytes/hash under the documented policy.
 - [x] CLN-07 Run each relevant case through both fetch and fallback; assert identical policy, correct commit and cleanup.
-- [ ] CLN-08 Prove retained helper/proxy/CA configuration with synthetic values and a local authenticated HTTP fixture clone using synthetic credentials. Merely reading helper config does not establish authenticated cloning.
+- [x] CLN-08 Prove retained helper/proxy/CA configuration with synthetic values and a local authenticated HTTP fixture clone using synthetic credentials. Merely reading helper config does not establish authenticated cloning.
 - [x] CLN-09 Apply one localized repair to an attributed CRLF file; assert only the intended line/file changes. Run render LF/wire-output assertions separately from clone fidelity.
 - [ ] CLN-10 Run hosted CRLF/render/remediation regression checks plus the repeatable Linux matrix. The existing `crlf_checkouts` workflow flag exercises Ubuntu with Windows-style Git preferences, not native Windows.
 - [x] CLN-11 If native Windows is supported, qualify both checkout paths and owned child/descendant termination there. Otherwise explicitly document Linux execution support and native Windows as unqualified.
@@ -131,12 +146,12 @@ platforms, and the issue records the supported guarantee and exclusions.
 
 ### Required behavioral evidence
 
-- [ ] LSE-11 Test stalled Git/descendant, slow failed-fetch→fallback, Helm/Kustomize, apply, digest lookup, optional version lookup and local HTTP body/send. Assert elapsed limits, no subsequent work and owned cleanup.
+- [x] LSE-11 Test stalled Git/descendant, slow failed-fetch→fallback, Helm/Kustomize, apply, digest lookup, optional version lookup and local HTTP body/send. Assert elapsed limits, no subsequent work and owned cleanup.
 - [x] LSE-12 Test sequential stalled validation commands against one shared short budget; confirm process termination and no late state write.
 - [x] LSE-13 Test nearly expired resumed claims, malformed/denied renewal and transient retries bounded by confirmed expiry. Test duplicate sequences/results, wrong identities and result persistence racing with expiry.
-- [ ] LSE-14 Test create succeeded but response lost, finalize→failed redeploy, concurrent deploy/validate/finalize, cleanup failure and restart. Preserve deterministic sandbox identity, receipt compatibility and ownership.
+- [x] LSE-14 Test create succeeded but response lost, finalize→failed redeploy, concurrent deploy/validate/finalize, cleanup failure and restart. Preserve deterministic sandbox identity, receipt compatibility and ownership.
 - [x] LSE-15 Test uncertain publication plus restart: no second remote mutation. Expired publication must issue no HTTP mutation; retain a clear manual-reconciliation state.
-- [ ] LSE-16 Run paired HTTP renewal denial during a slow operation: no executor completion/late result, bounded server work, workspace cleanup and journal deletion only after successful cleanup.
+- [x] LSE-16 Run paired HTTP renewal denial during a slow operation: no executor completion/late result, bounded server work, workspace cleanup and journal deletion only after successful cleanup.
 - [x] LSE-17 Run paired restart during an operation lasting longer than its lease (for example diagnosis35s, TTL30). Show successful renewals, same sandbox after restart, eventual terminal outcome and cleanup. Count distinct action IDs, not replay deliveries, when asserting patch attempts.
 - [ ] LSE-18 Include these short-lease/deadline/denial controls in hosted qualification. Existing long-lease Secret-kind proof does not establish heartbeat behavior; mock timing tests do not prove real kubectl cancellation.
 
@@ -147,13 +162,20 @@ the versioned consumer/controller pair is delivered.
 
 ## 5. Contract release, CI and hosting order
 
+2026-10-19: the user approved annotated contracts-v1.4.0 at merged Ignis
+f1f3b2c858c6ce246308eae395e280856459d9a5. Canonical GitHub sync/Check passes;
+Raphael runtime defaults use the contract pin through one shared CI resolver.
+REL-06/07 are satisfied on PR #50. Current-head hosted qualification and required
+positive image proof remain separate gates. See [the CI repair record](https://github.com/AWaleed-Ahmed/Raphael/blob/main/docs/ci-repair-review-2026-10-19.md).
+
+
 This is primarily GitHub Actions qualification on disposable Ubuntu/kind
 runners. A persistent public server/domain or production Kubernetes account
 is not needed to complete these synthetic integration checks.
 
 1. [x] REL-01 Restore/reimplement and review missing code; attach fresh local evidence before requesting release approval.
-2. [ ] REL-02 Publish exact candidate heads and pin all three Raphael cross-repository jobs to the same reviewed Ignis SHA for qualification. Current branch-name special cases refer to an older `codex/...` branch, not these new branches. The Secret-fixture job currently hard-pins the old release; a manual override for other jobs does not update it.
-3. [ ] REL-03 Verify workflow triggers. Raphael core CI runs on `feature/**` pushes and PRs to main; cross-repository E2E does not run on this feature push alone. Ignis CI runs on main pushes/PRs to main. Pushing the branches does not prove all checks ran.
+2. [x] REL-02 Publish exact candidate heads and pin all three Raphael cross-repository jobs to the same reviewed Ignis SHA for qualification. One validated shared resolver now feeds all three jobs, including Secret-kind. Candidate qualification uses a full immutable SHA override.
+3. [x] REL-03 Verify workflow triggers. Raphael core CI runs on `feature/**` pushes and PRs to main; cross-repository E2E does not run on this feature push alone. Ignis CI runs on main pushes/PRs to main. Pushing the branches does not prove all checks ran.
 4. [ ] REL-04 Run candidate cross-repo jobs: mock/wire/real-hooks/evals/report audit; real-kind remediation including the pending positive case; Secret-fixture kind. Retain `if: always()` artifact/cluster cleanup, dry-run publishing and no application publishing token.
 5. [ ] REL-05 Inspect artifacts, not just green summaries. Record skipped cases explicitly, fix failures and rerun on current heads. Complete the #13 matrix and #17 timing/denial coverage rather than substituting generic integration success.
 6. [ ] REL-06 Review the additive contract diff (including deployment budget and restored lease/HTTP contracts), schema snapshots, auth/status semantics and compatibility. Obtain approval for Ignis merge/release and choose an immutable version using repository conventions; never retarget an existing tag.
@@ -163,9 +185,9 @@ is not needed to complete these synthetic integration checks.
 10. [ ] REL-10 Update both implementation reviews, Raphael handoff and each issue with delivered behavior, proof links and limits. Close each issue only after its own acceptance conditions above are met.
 
 Useful workflow inputs for an authorized manual candidate run:
-`ignis_ref=<FULL_REVIEWED_SHA>`, `pending_bad_image_positive=true`, and a separate
-run with `crlf_checkouts=true`. These do not replace fixing the Secret-kind pin
-or making the positive case required after release. No workflow dispatch,
+`ignis_ref=<FULL_REVIEWED_SHA>` and `crlf_checkouts=true`. The positive case is
+required automatically; the obsolete optional-positive input was removed. This
+does not replace final approved release/pin alignment. No workflow dispatch,
 release, PR or merge is authorized merely by this checklist.
 
 ## 6. Evidence record template
