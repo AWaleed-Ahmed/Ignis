@@ -66,4 +66,4 @@ The public repository does not provide a production remediation path. Human revi
 
 ## License
 
-The repository license will be selected by the project owner before the first public release. Do not treat an unlicensed checkout as granting permission to redistribute or use the code.
+Licensed under the [Apache License, Version 2.0](LICENSE).
