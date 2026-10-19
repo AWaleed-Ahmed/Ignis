@@ -1925,7 +1925,7 @@ mod secret_coverage_fidelity_tests {
                     },
                     patch: None,
                     wait_seconds: 0,
-                    deploy_timeout_seconds: None,
+                    deploy_timeout_seconds: default_deploy_timeout_seconds(),
                 },
             )
             .await
@@ -1977,6 +1977,33 @@ mod secret_coverage_fidelity_tests {
         assert!(!response_without_raw_files
             .to_string()
             .contains(BUNDLED_SENTINEL));
+
+        // Reapplying the same bundled fixture must not collide with an inventory
+        // synthesized for the previous candidate. Keep selected fixtures separate.
+        let replay = service.deploy_revision(&created.sandbox_id, serde_json::from_value(
+            serde_json::json!({"repository_sha":"abcdef0123456789", "workspace_path":workspace.path(),
+                "manifests":{"type":"yaml","path":"app.yaml"}, "wait_seconds":0})
+        ).unwrap()).await.unwrap();
+        assert!(replay.fidelity.secret_coverage.as_ref().unwrap().complete);
+        assert!(replay
+            .fidelity
+            .secret_coverage
+            .as_ref()
+            .unwrap()
+            .references
+            .iter()
+            .all(|reference| reference.status == SecretCoverageStatus::Covered));
+        assert_eq!(
+            registry
+                .get(&created.sandbox_id)
+                .unwrap()
+                .applied_secret_fixtures
+                .as_ref()
+                .unwrap()
+                .secrets
+                .len(),
+            1
+        );
 
         let persisted = registry.get(&created.sandbox_id).unwrap();
         assert!(persisted
