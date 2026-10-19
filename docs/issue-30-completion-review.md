@@ -36,4 +36,17 @@ Standards: zero actionable findings for Raphael f056557..89c548f and Ignis bc425
 
 The existing cross-repo workflow now includes both additional mock evaluations and upgrades the real-kind probe case to require a covered Secret reference, a target-only probe repair, passing validation and independently Ready post-fix observation. The six existing Secret kind controls remain. Hosted run links/results and exact candidate identities are recorded in the paired PR descriptions; local mocks do not establish actual Kubernetes behavior.
 
+Verified hosted source identities: Raphael `2b6366d15943b9b5aa8ef814c70d5f255c571514`, Ignis candidate `26615d61ca6b034bec0cbd00467edb15a95a67a5`. Automatic PR checkout used synthetic merge `494e14b175113f2f6d5229d8d62ed420f911a8b4`.
+
+| Hosted run | Actual result |
+| --- | --- |
+| [Raphael core39318124727](https://github.com/AWaleed-Ahmed/Raphael/actions/runs/39318124727) | Python and canonical contract checks pass |
+| [Ignis CI39318096845](https://github.com/AWaleed-Ahmed/Ignis/actions/runs/39318096845) | Rust, Secret scan and both owned system-attribute matrices pass |
+| [Paired candidate CRLF39318120261](https://github.com/AWaleed-Ahmed/Raphael/actions/runs/39318120261) | All three runtime jobs pass against the same explicit candidate SHA |
+| [Current-release compatibility39318124798](https://github.com/AWaleed-Ahmed/Raphael/actions/runs/39318124798) | All three runtime jobs pass with default contracts-v1.4.1 |
+
+Artifacts inspected: both new evaluations pass (missing escalated as unresolved_secret_dependency with zero patch lines/no publication; covered fix_finalized with exactly two probe-port lines changed). On candidate and current release, the real-kind probe case retains one complete covered payments-db/DATABASE_URL reference and reaches fix_finalized with independently Ready observation. All four remediation and six Secret controls pass on the candidate. Lease/deadline, wire/restart and original seven evals remain green. These are synthetic Linux/kind controls, not production proof. Evidence-only commits after these heads retain the qualified runtime source and have their own automatic PR checks.
+
+Review in [Raphael #55](https://github.com/AWaleed-Ahmed/Raphael/pull/55) and [Ignis #20](https://github.com/AWaleed-Ahmed/Ignis/pull/20). Both are unmerged; Raphael remains draft for coordinated runtime delivery.
+
 Keep CONTRACTS_VERSION at released contracts-v1.4.1 until Ignis #20 is reviewed/merged and an approved immutable runtime release is available. Candidate qualification uses one explicit full Ignis SHA for every runtime job. No schema bytes changed. Do not close #30 on local tests alone; reviewed runtime delivery and released-pair hosted evidence remain requirements. Native Windows and universal credential/value detection are outside this proof.
