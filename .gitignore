@@ -46,3 +46,11 @@ Thumbs.db
 /docs/restore-13-17-review-2026-10-19.md
 /docs/result-delivery-fix-review-2026-10-19.md
 /docs/secret-coverage-review.md
+
+# Local caches, coverage, and generated artifacts
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
