@@ -339,6 +339,7 @@ mod tests {
         .to_string();
 
         let workspace = clone_at_sha(source.path().to_str().unwrap(), &sha).unwrap();
+        assert_blob_and_checkout_hashes(&workspace);
         assert_eq!(
             fs::read(workspace.join("plain.txt")).unwrap(),
             b"one\ntwo\n"
@@ -391,9 +392,56 @@ mod tests {
             fs::read(fallback.path().join("binary.bin")).unwrap(),
             b"one\r\ntwo\0\n"
         );
+        assert_blob_and_checkout_hashes(fallback.path());
         assert_additional_bytes(fallback.path());
         assert_minimal_patch(fallback.path());
         drop(fallback);
+    }
+
+    fn assert_blob_and_checkout_hashes(workspace: &Path) {
+        use sha2::{Digest, Sha256};
+        for (path, blob, checkout) in [
+            (
+                "plain.txt",
+                b"one\ntwo\n".as_slice(),
+                b"one\ntwo\n".as_slice(),
+            ),
+            ("windows.txt", b"one\ntwo\n", b"one\r\ntwo\r\n"),
+            (
+                "mixed.txt",
+                b"one\r\ntwo\nthree\r\n",
+                b"one\r\ntwo\nthree\r\n",
+            ),
+            ("nested/lf.txt", b"one\ntwo\n", b"one\ntwo\n"),
+            ("binary.bin", b"one\r\ntwo\0\n", b"one\r\ntwo\0\n"),
+            (
+                "authored-crlf.txt",
+                b"original\r\nbytes\r\n",
+                b"original\r\nbytes\r\n",
+            ),
+            ("unicode.txt", "café\n".as_bytes(), "café\n".as_bytes()),
+            ("no-newline.txt", b"no final newline", b"no final newline"),
+        ] {
+            let output = Command::new("git")
+                .args(["show", &format!("HEAD:{path}")])
+                .current_dir(workspace)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, blob, "blob bytes for {path}");
+            assert_eq!(
+                Sha256::digest(&output.stdout),
+                Sha256::digest(blob),
+                "blob hash for {path}"
+            );
+            let actual = fs::read(workspace.join(path)).unwrap();
+            assert_eq!(actual, checkout, "checkout bytes for {path}");
+            assert_eq!(
+                Sha256::digest(&actual),
+                Sha256::digest(checkout),
+                "checkout hash for {path}"
+            );
+        }
     }
 
     fn assert_additional_bytes(workspace: &Path) {
@@ -427,6 +475,7 @@ mod tests {
         .unwrap();
         let diff = Command::new("git")
             .args(["diff", "--numstat"])
+            .env("GIT_ATTR_NOSYSTEM", "1")
             .current_dir(workspace)
             .output()
             .unwrap();
@@ -444,7 +493,9 @@ mod tests {
 
     fn git(cwd: &Path, args: &[&str]) {
         let output = Command::new("git")
+            .args(["-c", "core.attributesFile=/dev/null"])
             .args(args)
+            .env("GIT_ATTR_NOSYSTEM", "1")
             .current_dir(cwd)
             .output()
             .unwrap();
@@ -454,5 +505,119 @@ mod tests {
             args.join(" "),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_http_clone_uses_retained_credential_helper_in_both_paths() {
+        if std::env::var_os("IGNIS_AUTH_HTTP_CHILD").is_some() {
+            let url = std::env::var("IGNIS_AUTH_HTTP_URL").unwrap();
+            let sha = std::env::var("IGNIS_AUTH_HTTP_SHA").unwrap();
+            for fallback in [false, true] {
+                let workspace = clone_at_sha_internal(
+                    &url,
+                    &sha,
+                    crate::deadline::Deadline::new(Duration::from_secs(15)),
+                    fallback,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(
+                    fs::read(workspace.path().join("file.txt")).unwrap(),
+                    b"owned fixture\n"
+                );
+                assert_eq!(
+                    workspace.path().join(".git/shallow").exists(),
+                    !fallback,
+                    "test must exercise shallow fetch and full fallback independently"
+                );
+            }
+            return;
+        }
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("repo.git");
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--template="]);
+        fs::write(source.join("file.txt"), "owned fixture\n").unwrap();
+        git(&source, &["add", "."]);
+        git(
+            &source,
+            &[
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "user.name=Fixture",
+                "commit",
+                "-m",
+                "owned",
+            ],
+        );
+        let sha = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&source)
+            .output()
+            .unwrap();
+        let sha = String::from_utf8(sha.stdout).unwrap().trim().to_string();
+        let status_path = directory.path().join("http-status.json");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../harness/git_http_fixture.py");
+        let child = Command::new("python3")
+            .arg(fixture)
+            .arg(directory.path())
+            .arg(&status_path)
+            .spawn()
+            .unwrap();
+        struct Server(std::process::Child);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let _server = Server(child);
+        let started = std::time::Instant::now();
+        let status: serde_json::Value = loop {
+            if let Ok(bytes) = fs::read(&status_path) {
+                if let Ok(value) = serde_json::from_slice(&bytes) {
+                    break value;
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "HTTP fixture startup timed out"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let helper = directory.path().join("credential-helper");
+        let helper_calls = directory.path().join("helper-calls");
+        let mut file = fs::File::create(&helper).unwrap();
+        writeln!(file, "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\nif [ \"$1\" = get ]; then printf 'username=fixture-user\\npassword=fixture-pass\\n'; fi", helper_calls.display()).unwrap();
+        drop(file);
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = directory.path().join("gitconfig");
+        fs::write(
+            &config,
+            format!(
+                "[credential]\n helper = {}\n[http]\n proxy =\n",
+                helper.display()
+            ),
+        )
+        .unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/repo.git",
+            status["port"].as_u64().unwrap()
+        );
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "gitclone::tests::authenticated_http_clone_uses_retained_credential_helper_in_both_paths"])
+            .env("IGNIS_AUTH_HTTP_CHILD", "1").env("IGNIS_AUTH_HTTP_URL", url)
+            .env("IGNIS_AUTH_HTTP_SHA", sha).env("GIT_CONFIG_GLOBAL", config)
+            .env("GIT_TERMINAL_PROMPT", "0").status().unwrap();
+        assert!(status.success());
+        assert!(fs::read_to_string(helper_calls).unwrap().contains("get"));
+        let stats: serde_json::Value =
+            serde_json::from_slice(&fs::read(status_path).unwrap()).unwrap();
+        assert!(stats["unauthorized"].as_u64().unwrap() > 0);
+        assert!(stats["authorized"].as_u64().unwrap() > 0);
+        assert!(stats["uploads"].as_u64().unwrap() >= 2);
     }
 }
