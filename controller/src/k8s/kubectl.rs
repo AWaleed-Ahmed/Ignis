@@ -968,4 +968,113 @@ mod image_evidence_tests {
             "unknown"
         );
     }
+
+    #[test]
+    fn event_confirmation_requires_current_uid_fresh_complete_unique_image() {
+        let now = chrono::Utc::now();
+        for control in [
+            "valid",
+            "uid",
+            "name",
+            "old",
+            "before-pod",
+            "truncated",
+            "shared-image",
+            "conflict",
+        ] {
+            let mut raw = json!({"items":[{
+                "metadata":{"name":"app-123","uid":"pod-1","creationTimestamp":(now-chrono::Duration::minutes(1)).to_rfc3339()},
+                "spec":{"containers":[{"name":"app","image":"registry.example/app:v7"}]},
+                "status":{"phase":"Pending","containerStatuses":[{"name":"app","image":"registry.example/app:v7","state":{"waiting":{"reason":"ImagePullBackOff"}}}]}
+            }]});
+            if control == "shared-image" {
+                raw["items"][0]["spec"]["containers"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"name":"sidecar","image":"registry.example/app:v7"}));
+            }
+            if control == "conflict" {
+                raw["items"][0]["status"]["containerStatuses"][0]["state"]["waiting"]["message"] =
+                    json!("unauthorized");
+            }
+            let mut event = json!({"reason":"Failed","message":"Failed to pull image \"registry.example/app:v7\": manifest unknown",
+                "involvedObject":{"kind":"Pod","name":"app-123","uid":"pod-1"},"lastTimestamp":now.to_rfc3339()});
+            match control {
+                "uid" => event["involvedObject"]["uid"] = json!("old-pod"),
+                "name" => event["involvedObject"]["name"] = json!("another-pod"),
+                "old" => {
+                    event["lastTimestamp"] =
+                        json!((now - chrono::Duration::minutes(6)).to_rfc3339())
+                }
+                "before-pod" => {
+                    event["lastTimestamp"] =
+                        json!((now - chrono::Duration::minutes(2)).to_rfc3339())
+                }
+                "truncated" => {
+                    event["message"] = json!(format!(
+                        "{}{}",
+                        event["message"].as_str().unwrap(),
+                        "x".repeat(2048)
+                    ))
+                }
+                _ => {}
+            }
+            let observation = WorkloadObservation {
+                source: ObservationSource::Runtime,
+                pods: parse_pods_json(&raw.to_string()),
+                events: parse_events_json(&json!({"items":[event]}).to_string()),
+                rendered_hint: None,
+            };
+            let signature = crate::observe::observe(&observation, None);
+            assert_eq!(
+                signature.class,
+                if control == "valid" {
+                    "bad_image_reference"
+                } else {
+                    "unknown"
+                },
+                "{control}"
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_owner_requires_exact_namespace_and_both_owner_uids() {
+        for control in [
+            "valid",
+            "rs-uid",
+            "deployment-uid",
+            "namespace",
+            "denied",
+            "multiple-owners",
+        ] {
+            let mut pods = vec![ObservedPod {
+                replica_set: Some(("app-rs".into(), "rs-1".into())),
+                ..Default::default()
+            }];
+            let mut owners = json!({"items":[
+                {"kind":"ReplicaSet","metadata":{"name":"app-rs","uid":"rs-1","namespace":"owned","ownerReferences":[{"kind":"Deployment","name":"app","uid":"dep-1","controller":true}]}},
+                {"kind":"Deployment","metadata":{"name":"app","uid":"dep-1","namespace":"owned"}}
+            ]});
+            match control {
+                "rs-uid" => owners["items"][0]["metadata"]["uid"] = json!("old-rs"),
+                "deployment-uid" => owners["items"][1]["metadata"]["uid"] = json!("old-deployment"),
+                "namespace" => owners["items"][1]["metadata"]["namespace"] = json!("other"),
+                "denied" => owners["items"] = json!([]),
+                "multiple-owners" => owners["items"][0]["metadata"]["ownerReferences"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(
+                        json!({"kind":"Deployment","name":"other","uid":"other","controller":true}),
+                    ),
+                _ => {}
+            }
+            resolve_deployment_owners(&mut pods, &owners.to_string(), "owned");
+            assert_eq!(
+                pods[0].deployment.is_some(),
+                control == "valid",
+                "{control}"
+            );
+        }
+    }
 }

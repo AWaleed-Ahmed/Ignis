@@ -89,4 +89,42 @@ mod tests {
             "controller guard must replay without a second namespace create"
         );
     }
+
+    #[tokio::test]
+    async fn lost_create_response_replays_from_disk_after_controller_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend = Arc::new(MockCluster::with_store(directory.path()).unwrap());
+        let store = Arc::new(
+            crate::state::sqlite::SqliteStore::open(directory.path().join("records")).unwrap(),
+        );
+        let service = Arc::new(SandboxService::with_recovery(
+            backend.clone(),
+            Arc::new(SandboxRegistry::with_store(store.clone()).unwrap()),
+            Arc::new(RecoveryStore::open(directory.path()).unwrap()),
+        ));
+        let request = || {
+            Request::builder().method("POST").uri("/v1/sandboxes")
+            .header("content-type", "application/json").header("x-raphael-connector-action-id", "lost-create")
+            .body(Body::from(json!({"run_id":"lost-create","tenant_id":"test","repository":{"owner":"o","name":"n"},"commit_sha":"1234567"}).to_string())).unwrap()
+        };
+        let first = router(service).oneshot(request()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let bytes = first.into_body().collect().await.unwrap().to_bytes();
+        // The client never acknowledges/uses that response. Reopen both durable
+        // controller stores and resend the identical action after restart.
+        let restarted_backend = Arc::new(MockCluster::with_store(directory.path()).unwrap());
+        let restarted = Arc::new(SandboxService::with_recovery(
+            restarted_backend.clone(),
+            Arc::new(SandboxRegistry::with_store(store).unwrap()),
+            Arc::new(RecoveryStore::open(directory.path()).unwrap()),
+        ));
+        let replay = router(restarted).oneshot(request()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            bytes,
+            replay.into_body().collect().await.unwrap().to_bytes()
+        );
+        assert_eq!(backend.create_call_count(), 1);
+        assert_eq!(restarted_backend.create_call_count(), 0);
+    }
 }
