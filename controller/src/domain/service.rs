@@ -1581,10 +1581,35 @@ mod action_deadline_tests {
         // A real backend can lose a namespace between successful finalize and
         // redeploy. Mock deletion reproduces an apply failure after invalidation.
         backend.destroy_namespace(&created.namespace).await.unwrap();
-        assert!(service
-            .deploy_revision(&created.sandbox_id, deploy)
+        let held = service.lock_sandbox(&created.sandbox_id).await.unwrap();
+        let deployment = service.deploy_revision(&created.sandbox_id, deploy);
+        let validating = service.run_validation(&created.sandbox_id, validation.clone());
+        let finalizing = service.finalize_result(
+            &created.sandbox_id,
+            FinalizeResultRequest {
+                notes: None,
+                require_patch: false,
+            },
+        );
+        tokio::pin!(deployment, validating, finalizing);
+        // Poll all real public operations into the FIFO mutex queue while the
+        // deployment is blocked. None may observe/freeze the old successful state.
+        assert!(timeout(Duration::from_millis(20), &mut deployment)
             .await
             .is_err());
+        assert!(timeout(Duration::from_millis(20), &mut validating)
+            .await
+            .is_err());
+        assert!(timeout(Duration::from_millis(20), &mut finalizing)
+            .await
+            .is_err());
+        drop(held);
+        let (deployed, validated, finalized) = timeout(Duration::from_secs(2), async {
+            tokio::join!(deployment, validating, finalizing)
+        })
+        .await
+        .unwrap();
+        assert!(deployed.is_err() && validated.is_err() && finalized.is_err());
         let record = registry.get(&created.sandbox_id).unwrap();
         assert!(record.finalized_result.is_none() && record.last_validation.is_none());
         assert!(record.deployed_sha.is_none() && record.rendered_yaml.is_none());
