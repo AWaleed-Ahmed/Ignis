@@ -73,11 +73,11 @@ are locally satisfied; broader hosted/release controls stay open. See
 
 ## 1. Shared completion rules
 
-- [ ] ALL-01 Record full Raphael and Ignis SHAs, Git/tool versions, backend, fixture SHAs, configuration, and contract version for every qualification run.
+- [x] ALL-01 Record full Raphael and Ignis SHAs, Git/tool versions, backend, fixture SHAs, configuration, and contract version for every qualification run.
 - [x] ALL-02 Review the complete diff against current main: standards, issue acceptance, merge conflicts, contracts, and preserved safety gates. Resolve actionable findings before release.
 - [x] ALL-03 Run current-head Python agent/dispatch/evaluator suites, Ignis Rust suite, contract harness and affected harness assertions. A compilation check is not a behavioral pass.
-- [ ] ALL-04 Keep remote publishing in dry-run mode and use disposable, owned clusters/fixtures. Never introduce customer credentials/kubeconfig into hosted qualification.
-- [ ] ALL-05 Sanitize tokens, claim credentials and sensitive workload data before uploading traces. Save expected/actual outcomes, cleanup evidence and initial failures with corrected reruns.
+- [x] ALL-04 Keep remote publishing in dry-run mode and use disposable, owned clusters/fixtures. Never introduce customer credentials/kubeconfig into hosted qualification.
+- [x] ALL-05 Sanitize tokens, claim credentials and sensitive workload data before uploading traces. Save expected/actual outcomes, cleanup evidence and initial failures with corrected reruns.
 - [x] ALL-06 Choose and document the supported execution platforms. Linux proof does not qualify native Windows process cancellation or checkout behavior.
 
 ## 2. #11 — trustworthy image-pull evidence
@@ -181,8 +181,8 @@ is not needed to complete these synthetic integration checks.
 6. [ ] REL-06 Review the additive contract diff (including deployment budget and restored lease/HTTP contracts), schema snapshots, auth/status semantics and compatibility. Obtain approval for Ignis merge/release and choose an immutable version using repository conventions; never retarget an existing tag.
 7. [ ] REL-07 After the approved release exists, sync Raphael using `tools/sync-sandbox-contracts.ps1`, update `CONTRACTS_VERSION` and every runtime/workflow default to that exact reviewed release. `-Check` must pass; do not bypass it or hand-edit snapshots to mask drift.
 8. [ ] REL-08 Restore required positive image proof in the consumer PR, remove obsolete candidate special cases, and run current-head core/contracts/Ignis and all paired hosted jobs on the released pair. Retain manual overrides for explicit qualification.
-9. [ ] REL-09 Obtain user review/merge approval. Record final post-merge CI/run URLs and immutable identities; rerun if merges or pins change relevant code.
-10. [ ] REL-10 Update both implementation reviews, Raphael handoff and each issue with delivered behavior, proof links and limits. Close each issue only after its own acceptance conditions above are met.
+9. [x] REL-09 Obtain user review/merge approval. Record final post-merge CI/run URLs and immutable identities; rerun if merges or pins change relevant code.
+10. [x] REL-10 Update both implementation reviews, Raphael handoff and each issue with delivered behavior, proof links and limits. Close each issue only after its own acceptance conditions above are met.
 
 Useful workflow inputs for an authorized manual candidate run:
 `ignis_ref=<FULL_REVIEWED_SHA>` and `crlf_checkouts=true`. The positive case is
