@@ -18,7 +18,7 @@ From the repository root:
 ```bash
 RAPHAEL_CLUSTER_BACKEND=mock \
 RAPHAEL_LISTEN=127.0.0.1:8090 \
-  cargo run --manifest-path controller/Cargo.toml
+  cargo run --locked --manifest-path controller/Cargo.toml
 ```
 
 In a second terminal, run the manual tests:
@@ -26,7 +26,8 @@ In a second terminal, run the manual tests:
 ```bash
 python3 -m venv tests/.venv
 . tests/.venv/bin/activate
-python -m pip install httpx
+python -m pip install --require-hashes -r requirements-bootstrap.txt
+python -m pip install httpx 'certifi>=2026.10.19'
 python tests/test.py
 ```
 
@@ -47,7 +48,7 @@ Start the controller with:
 RAPHAEL_CLUSTER_BACKEND=kind \
 RAPHAEL_KUBE_CONTEXT=kind-raphael-sandbox \
 RAPHAEL_LISTEN=127.0.0.1:8090 \
-  cargo run --manifest-path controller/Cargo.toml
+  cargo run --locked --manifest-path controller/Cargo.toml
 ```
 
 Then run the test client against `http://127.0.0.1:8090`.
