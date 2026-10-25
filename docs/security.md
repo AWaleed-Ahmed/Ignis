@@ -42,6 +42,11 @@ The connector may invoke only typed sandbox operations. It must reject unknown p
 
 ## Release checks
 
+For the October 2026 certificate-trust and TLS dependency updates, see the
+[security validation record](https-security-validation-2026-10-25.md).
+Build the candidate with `--locked`; already installed binaries require a
+reviewed rebuild/release and restart to receive the updated trust configuration.
+
 Before each public release, inspect the complete tree and history for credentials and private implementation details. At minimum, verify that the repository contains no `.env` files, service-role keys, GitHub tokens, internal API URLs, `contracts/agent`, private reasoning documents, or production write permissions.
 
 A clean working tree is not sufficient. Public history must also be fresh and must not be derived from the private monorepo’s internal commit history.
