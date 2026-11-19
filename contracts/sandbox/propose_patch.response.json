@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/propose_patch.response.json",
+  "title": "ProposePatchResponse",
+  "description": "Outcome of a connector-side LLM patch proposal. Files use the same shape as deploy_revision patch.files. Credentials, prompts and raw completions never appear here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "usage"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["proposed", "declined", "unavailable"],
+      "description": "proposed: files returned; declined: the model reported it cannot fix this safely; unavailable: no model call produced a usable answer."
+    },
+    "summary": { "type": "string", "maxLength": 2000 },
+    "files": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "content"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$)).+$"
+          },
+          "content": { "type": "string", "maxLength": 262144 }
+        }
+      }
+    },
+    "unavailable_reason": {
+      "type": "string",
+      "enum": ["not_configured", "budget_exhausted", "provider_error", "timeout", "invalid_output"]
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["calls"],
+      "properties": {
+        "provider": { "type": "string", "maxLength": 64 },
+        "model": { "type": "string", "maxLength": 128 },
+        "local": { "type": "boolean", "description": "True when the model endpoint is customer-local and keyless." },
+        "calls": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "latency_ms": { "type": "integer", "minimum": 0 }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "status": { "const": "proposed" } } },
+      "then": { "required": ["files", "summary"], "properties": { "files": { "minItems": 1 } } }
+    },
+    {
+      "if": { "properties": { "status": { "const": "unavailable" } } },
+      "then": { "required": ["unavailable_reason"] }
+    },
+    {
+      "if": { "properties": { "status": { "enum": ["declined", "unavailable"] } } },
+      "then": { "not": { "required": ["files"] } }
+    }
+  ]
+}
