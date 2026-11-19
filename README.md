@@ -221,6 +221,12 @@ Ignis reads exported environment variables. The controller does not load an
 | `RAPHAEL_CONNECTOR_TENANT_ID` | `connector`; must match the dispatch token's tenant |
 | `RAPHAEL_CONNECTOR_POLL_INTERVAL_MS` | `1000` |
 | `RAPHAEL_CONNECTOR_HTTP_TIMEOUT_SECONDS` | `30`, positive integer |
+| `RAPHAEL_CONNECTOR_LLM_BASE_URL` | Unset disables `propose_patch` (it answers `unavailable`). Otherwise your model's OpenAI-compatible base URL, such as `https://api.openai.com/v1` or `http://localhost:11434/v1` for Ollama. Non-local endpoints must use https. |
+| `RAPHAEL_CONNECTOR_LLM_MODEL` | Required with a base URL; the model name your endpoint serves |
+| `RAPHAEL_CONNECTOR_LLM_API_KEY` | Your provider key. Required for non-local endpoints; optional for local (loopback, private network, in-cluster) servers. |
+| `RAPHAEL_CONNECTOR_LLM_PROVIDER` | Optional label in usage reports; defaults to `local` or `openai_compatible` |
+| `RAPHAEL_CONNECTOR_LLM_MAX_CALLS_PER_JOB` | `3` (1–3); hard cap enforced here, whatever Raphael requests |
+| `RAPHAEL_CONNECTOR_LLM_MAX_CALLS_PER_DAY` | `20`; hard daily cap, held in memory and reset on restart |
 
 The connector runs inside the controller process. It polls
 `/v1/tenants/{tenant_id}/jobs/next` and posts results to `/v1/results` on the
@@ -229,8 +235,25 @@ dispatch service. Pair it with Raphael using the
 and select compatible revisions before starting both services.
 
 Git cloning uses the executor environment's configured Git access. Never place
-credentials in repository URLs. Keep provider keys, Supabase keys and production
-kubeconfig out of Ignis.
+credentials in repository URLs. Keep Supabase keys and production kubeconfig out
+of Ignis.
+
+### Model-backed patch proposals (`propose_patch`)
+
+When `RAPHAEL_CONNECTOR_LLM_*` is set, the connector answers Raphael's `propose_patch`
+action itself.
+
+- **Context:** it reads 60–200 line windows around the localized lines from the job's own
+  clone and builds the prompt from its fixed `propose_patch/v1` template.
+- **Model call:** it calls **your** model with **your** key. The key, prompt and completion
+  never leave this process, and Raphael never receives or stores them.
+- **No free-form prompts:** Raphael sends typed context only, so it cannot use your key for
+  anything other than bounded patch proposals.
+- **Bounded edits:** the model may only edit lines it was shown, in writable paths.
+- **Limits:** redirects are not followed, and the per-job and daily caps above are
+  enforced locally.
+- **Untrusted output:** every proposal is untrusted. Raphael gates it and validates it in the
+  sandbox before showing it.
 
 ## Roadmap
 
