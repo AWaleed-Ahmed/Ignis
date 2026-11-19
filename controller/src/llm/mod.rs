@@ -4,3 +4,4 @@
 //! raphael-core sends typed incident context; the prompt template lives here.
 
 pub mod config;
+pub mod window;
