@@ -11,6 +11,7 @@ pub mod domain;
 pub mod fixtures;
 pub mod gitclone;
 pub mod k8s;
+pub mod llm;
 pub mod observe;
 pub mod policy;
 pub mod process;
