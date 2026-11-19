@@ -21,7 +21,8 @@
         "observe_failure",
         "run_validation",
         "finalize_result",
-        "destroy_sandbox"
+        "destroy_sandbox",
+        "propose_patch"
       ]
     },
     "status": {
