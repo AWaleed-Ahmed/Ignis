@@ -5,4 +5,5 @@
 
 pub mod config;
 pub mod edits;
+pub mod proposer;
 pub mod window;
