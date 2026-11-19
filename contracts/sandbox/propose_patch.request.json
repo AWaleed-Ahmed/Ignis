@@ -1,0 +1,105 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raphael.dev/contracts/sandbox/propose_patch.request.json",
+  "title": "ProposePatchRequest",
+  "description": "Typed incident context for a connector-side LLM patch proposal. The connector reads code windows from its own clone and builds the prompt from its versioned template; this request carries no free-form prompt, so a customer's model key can only be used for bounded patch proposals.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["repository_sha", "failure", "targets", "constraints", "attempt", "budget"],
+  "properties": {
+    "repository_sha": {
+      "type": "string",
+      "minLength": 7,
+      "description": "Revision the connector already cloned for this job."
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["failure_class", "signature_key"],
+      "properties": {
+        "failure_class": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "signature_key": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "summary": { "type": "string", "maxLength": 2000 }
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "maxItems": 10,
+      "description": "Redacted evidence summaries chosen by raphael-core.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["evidence_id", "summary"],
+        "properties": {
+          "evidence_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+          "summary": { "type": "string", "maxLength": 600 }
+        }
+      }
+    },
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5,
+      "description": "Localized lines; the connector sends the model a window of context_lines around each.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "line"],
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512,
+            "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$)).+$",
+            "description": "Repository-relative path; absolute paths and .. segments are invalid."
+          },
+          "line": { "type": "integer", "minimum": 1 },
+          "context_lines": { "type": "integer", "minimum": 60, "maximum": 200, "default": 120 }
+        }
+      }
+    },
+    "constraints": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["writable_path_prefixes"],
+      "properties": {
+        "writable_path_prefixes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20,
+          "items": { "type": "string", "minLength": 1, "maxLength": 512 }
+        },
+        "must": { "type": "array", "maxItems": 20, "items": { "type": "string", "maxLength": 300 } },
+        "must_not": { "type": "array", "maxItems": 20, "items": { "type": "string", "maxLength": 300 } }
+      }
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["number"],
+      "properties": {
+        "number": { "type": "integer", "minimum": 1, "maximum": 3 },
+        "previous_failure": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reason"],
+          "description": "Why the previous proposal was rejected, so the retry can correct it.",
+          "properties": {
+            "reason": { "type": "string", "enum": ["schema_invalid", "policy_rejected", "validation_failed"] },
+            "detail": { "type": "string", "maxLength": 2000 }
+          }
+        }
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_output_tokens", "timeout_seconds"],
+      "description": "Per-call limits from raphael-core. The connector also enforces its own hard caps.",
+      "properties": {
+        "max_output_tokens": { "type": "integer", "minimum": 256, "maximum": 4096 },
+        "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 60 }
+      }
+    }
+  }
+}
