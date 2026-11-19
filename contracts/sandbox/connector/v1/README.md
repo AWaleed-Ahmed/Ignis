@@ -8,7 +8,7 @@ Public wire schemas for the persistent outbound connection between a customer-ho
 |---|---|---|
 | `envelope.schema.json` | both | Outer frame every message uses; `kind` selects the payload schema |
 | `job.schema.json` | dispatch → connector | New work offer: repository, commit SHA, narrowed location; no source code |
-| `action.schema.json` | dispatch → connector | One instructed step; `verb` is restricted to the six sandbox operations |
+| `action.schema.json` | dispatch → connector | One instructed step; `verb` is restricted to the six sandbox operations plus connector-local `propose_patch` |
 | `result.schema.json` | connector → dispatch | Structured outcome of one action |
 | `terminal.schema.json` | dispatch → connector | Ends a job and instructs the connector to discard local state |
 | `ack.schema.json` | both | Receipt confirmation independent of action success or failure |
@@ -18,7 +18,7 @@ Public wire schemas for the persistent outbound connection between a customer-ho
 
 ## Design rules
 
-`action.schema.json` does not redefine the six verb payloads. Its `verb` field is a closed allowlist, while `args` must independently validate against the corresponding request schema in [`../../`](../../):
+`action.schema.json` does not redefine the verb payloads. Its `verb` field is a closed allowlist, while `args` must independently validate against the corresponding request schema in [`../../`](../../):
 
 ```text
 create_sandbox.request.json
@@ -27,11 +27,14 @@ observe_failure.request.json
 run_validation.request.json
 finalize_result.request.json
 destroy_sandbox.request.json
+propose_patch.request.json
 ```
 
 Likewise, a successful `result` must validate against the corresponding dotted response schema, such as `deploy_revision.response.json` or `finalize_result.response.json`. This avoids competing definitions of the sandbox API.
 
-No reasoning appears on this wire. A `job` identifies where the customer-hosted sandbox should look; an `action` identifies one typed operation to execute. Prompts, hypotheses, ranking, patch logic, and the decision about the next action remain private to `raphael-core`.
+No free-form prompt appears on this wire. A `job` identifies where the customer-hosted sandbox should look; an `action` identifies one typed operation to execute. Ranking, policy gates and the decision about the next action remain in `raphael-core`.
+
+`propose_patch` is the one model-backed verb. `raphael-core` sends typed incident context (failure, redacted evidence, localized targets, writable paths, attempt and budget). The connector reads code windows from its own clone, builds the prompt from its versioned template, and calls the customer's model with the customer's key. The key, prompt and completion never cross this wire. Because the request has no prompt field, a compromised `raphael-core` still cannot use a customer's key for anything other than a bounded patch proposal. The connector enforces its own hard call caps in addition to the request budget. Every proposal is untrusted: `raphael-core` applies its deterministic gates and sandbox validation before showing it.
 
 Every action carries an `action_id`. Replaying the same identifier must return a cached result rather than execute a side effect twice. This protects against duplicate deploys or finalization after reconnect and retry.
 
