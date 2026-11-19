@@ -73,7 +73,19 @@ async fn main() -> anyhow::Result<()> {
 
     if let Some(config) = ConnectorConfig::from_env()? {
         tracing::info!(dispatch_url = %config.dispatch_url, controller_url = %config.controller_url, "starting outbound connector");
-        let connector = Arc::new(Connector::from_config(config, recovery));
+        let llm = raphael_sandbox_controller::llm::config::LlmConfig::from_env()?;
+        match &llm {
+            Some(llm) => {
+                tracing::info!(provider = %llm.provider, model = %llm.model, local = llm.local, "connector LLM proposals enabled")
+            }
+            None => tracing::info!(
+                "connector LLM proposals disabled (RAPHAEL_CONNECTOR_LLM_BASE_URL unset)"
+            ),
+        }
+        let connector = Arc::new(
+            Connector::from_config(config, recovery)
+                .with_proposer(llm.map(raphael_sandbox_controller::llm::proposer::Proposer::new)),
+        );
         tokio::spawn(async move {
             if let Err(error) = connector.rehydrate().await {
                 tracing::warn!(error = %error, "connector recovery rehydration failed");
